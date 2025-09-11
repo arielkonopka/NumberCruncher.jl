@@ -47,3 +47,24 @@ julia -t threads
 ```
 Where *threads* is the number of concurrent instances, you would like to allow on your system.
 
+## Now, this is a real gym for your computer
+
+Do not run it with many threads, unless you gor plenty of RAM.
+It will eat up your whole CPU.
+I will have to refactor it somehow, but for now, be warned. In my case 6 threads was safe to run all the measurments.
+After you run the "do_the_thing" function, you will get a benchmark data for roughly 1000 points, which are estimated with that technique.
+There are multiple factors that affect the result, like number of neighbors, or maximal temporal shift, all that data is collected along with the raw data, so the result dataframe can be saved as a csv file:
+```julia
+   using CSV
+   CSV.write("yourfilename",df)
+```
+
+
+
+
+
+
+
+
+
+

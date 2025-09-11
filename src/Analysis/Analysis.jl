@@ -21,6 +21,36 @@ function weighted_center(points, dists,cx,cy)
     return [sum(weights .* X) / sum(weights), sum(weights .* Y) / sum(weights)]
 end
 
+function weighted_center2(points,
+                         dists::Vector{Float64},
+                         rPoint::Vector{Union{Float64,Nothing}})
+    d = length(rPoint)
+    n = length(points)
+    result = Vector{Float64}(undef, d)
+
+    # effective distances
+    eff_dists = copy(dists)
+    for i in 1:length(dists)
+        for j in 1:d
+            if(rPoint[j]!=nothing)
+                eff_dists[i]+=(rPoint[j]-points[i][j])^4
+            end
+        end
+
+    end
+    # weights
+    w = 1 ./ eff_dists
+    denom = sum(w)
+    M = reduce(hcat, points)
+    for j in 1:d
+        result[j] = sum(points[:,j] .* w) / denom 
+    end
+    return result
+end
+
+
+
+
 function find_neighbours(spaceSet,point)
     tree=KDTree(spaceSet)
     idxes,dists=knn(tree,point,neighs)

@@ -47,7 +47,8 @@ julia -t threads
 ```
 Where *threads* is the number of concurrent instances, you would like to allow on your system.
 
-##Your PC's Personal Workout: A High-Intensity Benchmark
+## Your PC's Personal Workout: A High-Intensity Benchmark
+
 Be aware that this program is a resource-intensive benchmark. It will consume a significant amount of your CPU and RAM. It is not recommended to run it with a large number of threads unless you have ample memory. While I intend to refactor it for better efficiency, for now, please proceed with caution. I found that running with six threads was a safe setting for all my measurements.
 
 After executing the *do_the_thing* function, the program will generate benchmark data for approximately 1000 points. The results are a reconstruction of the phase space from the input data, achieved by employing the [PECUZAL (Prediction Error of Coupled Units with a Zonal Adaptive Learning) algorithm](https://iopscience.iop.org/article/10.1088/1367-2630/abe336). 📈

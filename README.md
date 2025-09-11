@@ -47,24 +47,21 @@ julia -t threads
 ```
 Where *threads* is the number of concurrent instances, you would like to allow on your system.
 
-## Now, this is a real gym for your computer
+##Your PC's Personal Workout: A High-Intensity Benchmark
+Be aware that this program is a resource-intensive benchmark. It will consume a significant amount of your CPU and RAM. It is not recommended to run it with a large number of threads unless you have ample memory. While I intend to refactor it for better efficiency, for now, please proceed with caution. I found that running with six threads was a safe setting for all my measurements.
 
-Do not run it with many threads, unless you gor plenty of RAM.
-It will eat up your whole CPU.
-I will have to refactor it somehow, but for now, be warned. In my case 6 threads was safe to run all the measurments.
-After you run the "do_the_thing" function, you will get a benchmark data for roughly 1000 points, which are estimated with that technique.
-There are multiple factors that affect the result, like number of neighbors, or maximal temporal shift, all that data is collected along with the raw data, so the result dataframe can be saved as a csv file:
-```julia
-   using CSV
-   CSV.write("yourfilename",df)
+After executing the *do_the_thing* function, the program will generate benchmark data for approximately 1000 points. The results are a reconstruction of the phase space from the input data, achieved by employing the [PECUZAL (Prediction Error of Coupled Units with a Zonal Adaptive Learning) algorithm](https://iopscience.iop.org/article/10.1088/1367-2630/abe336). 📈
+
+Once the phase space is reconstructed, the next step involves estimating the subsequent data point. This is done by first identifying the neighbors of the last known point. A weighted average is then calculated, where the weights are determined by a combination of the neighbor's distance and the distance to the remaining known coordinates of the neighbor's successor.
+
+All collected data, including factors like the number of neighbors and maximal temporal shift, are included in the output DataFrame. You can easily save this data to a CSV file using the following Julia code:
+
+```Julia
+
+using CSV
+CSV.write("yourfilename", df)
 ```
 
-
-
-
-
-
-
-
+You will have the data, with the estimated values and real values, along with the distances to the real values. There is also added a visualization part, but it is not ready yet.
 
 

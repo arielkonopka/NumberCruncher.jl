@@ -1,4 +1,9 @@
-# NumberCruncher
+
+# The NumberCruncher.jl
+
+![the NumberCruncher logo](data/logo.png)
+
+>"Patience is a tree whose root is bitter, but its fruit is very sweet."
 
 Welcome to another one of my pet projects! 🚀  
 This time we will explore a couple of time series and try to **fiddle with the data they might contain**.  

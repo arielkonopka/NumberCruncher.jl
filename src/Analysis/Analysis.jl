@@ -10,11 +10,12 @@ function weighted_center(points, dists,cx,cy)
     Y = [p[2] for p in points]
     m=minimum(dists)
     if cx !== nothing
-        dists .+= ((X .- cx).^4)
+        dists .+= ((X .- cx).^2)
     end
     if cy !== nothing
-        dists .+= ((Y .- cy).^4)
+        dists .+= ((Y .- cy).^2)
     end
+ 
 
     weights = m ./ dists
     
@@ -30,15 +31,17 @@ function weighted_center2(points,
 
     # effective distances
     eff_dists = copy(dists)
+   # known coordinates added to weights
     for i in 1:length(dists)
+        distance=0.0
         for j in 1:d
             if(rPoint[j]!=nothing)
-                eff_dists[i]+=(rPoint[j]-points[i][j])^4
+               distance+=(rPoint[j]-points[i][j])^2
             end
         end
-
+        eff_dists[i]+=sqrt(distance)
     end
-    # weights
+   # weights
     w = 1 ./ eff_dists
     denom = sum(w)
     M = reduce(hcat, points)

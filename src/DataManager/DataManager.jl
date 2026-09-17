@@ -28,7 +28,7 @@ the 'log' columns are subtractions of logarithms od respectable Open or Close co
 we also do the cleaning up of the missing values
 """
 function AddDeltas!(df::DataFrame)
-    select!(df, Not([:conversionSymbol, :conversionType]))
+    # select!(df, Not([:conversionSymbol, :conversionType]))
     df.deltaO = vcat([df.open[i+1] - df.open[i] for i in 1:(nrow(df)-1)], missing)
     df.deltaC = vcat([df.close[i+1] - df.close[i] for i in 1:(nrow(df)-1)], missing)
    # df.deltaLogO=vcat([log(df.open[i+1]) - log(df.open[i]) for i in 1:(nrow(df)-1)], missing)

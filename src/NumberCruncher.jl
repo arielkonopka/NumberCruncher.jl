@@ -139,12 +139,10 @@ function run(backSize; windowSize=82000, msize=10)
     Y, tau_vals, ts_vals, Ls, epss = pecuzal_embedding(dataOJit; τs=0:msize, w=theiler, econ=true, verbose=false)
 
     # Wyodrębnienie rzeczywistych punktów historycznych do późniejszej walidacji.
-    realPoint = fill(0.0, length(tau_vals))
-    c = 1
-    for i in reverse(tau_vals)
-        realPoint[c] = mydf.deltaO[end-backSize-i+1]
-        c += 1
-    end
+    # Y[n] = (s[n+τ₁], …, s[n+τₘ]), so coordinate j of the next point Y[end+1]
+    # is s[N+1-(τmax-τⱼ)]; the τmax coordinate is the future value s[N+1].
+    tmax = maximum(tau_vals)
+    realPoint = [mydf.deltaO[end-backSize+1-(tmax-t)] for t in tau_vals]
     
     return (Y=Y, tau_vals=tau_vals, ts_vals=ts_vals, Ls=Ls, epss=epss, DTFrame=mydf, dataOJit=dataOJit, realPoint=realPoint)
 end
@@ -172,15 +170,15 @@ function analyzeit2(Y, df, taus, backSize)
     tLen = length(taus)
     
     # Przygotowanie wektora referencyjnego z uwzględnieniem brakujących współrzędnych (nothing).
+    # Y[n] = (s[n+τ₁], …, s[n+τₘ]) (DelayEmbeddings convention), so in Y[end+1]
+    # coordinate j is s[N+1-(τmax-τⱼ)]. The unknown future value s[N+1] sits at
+    # the coordinate with the largest delay, not at τ=0; PECUZAL delays are unsorted.
     rPoint = Vector{Union{Float64,Nothing}}(fill(nothing, tLen))
-    reversed_taus = reverse(taus)
-    idx=1
-    for i in 1:tLen
-        if(reversed_taus[i] != 0)
-            rPoint[i] = df.deltaO[end-backSize+1-reversed_taus[i]]
-        else
-            rPoint[i] = nothing
-            idx=i
+    tmax = maximum(taus)
+    idx = argmax(taus)
+    for j in 1:tLen
+        if j != idx
+            rPoint[j] = df.deltaO[end-backSize+1-(tmax-taus[j])]
         end
     end
     

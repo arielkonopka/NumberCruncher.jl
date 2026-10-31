@@ -4,27 +4,38 @@ include("DataManager/DataManager.jl")
 using .DataManager
 include("Analysis/Analysis.jl")
 using .Analysis
+include("Preprocessing/Preprocessor.jl")
+using .Preprocessor
 using DynamicalSystems
 using DataFrames
 using Base.Threads
-using Makie
 using HTTP
 using JSON
 using CSV
 using Dates
+using Random
+using Statistics
 
-export run, do_the_thing2, plot_aesthetic_analysis, update_bitcoin_data!
-const CRYPTOCOMPARE_KEY = strip(read(
-    joinpath(@__DIR__, "..", "config", "cryptocompare_key.txt"),
-    String
-))
+# `run` is deliberately not exported: it would clash with Base.run.
+export reconstruct, run_series, analyzeit2, do_the_thing, do_the_thing2, summarize,
+       update_from_cryptocompare!, plot_aesthetic_analysis, serve_gui
+const CRYPTOCOMPARE_KEY_FILE = joinpath(@__DIR__, "..", "config", "cryptocompare_key.txt")
+# Read at call time: the key is only needed for downloads, not to load the package.
+# The CRYPTOCOMPARE_KEY environment variable takes precedence over the file.
+function cryptocompare_key()
+    key = strip(get(ENV, "CRYPTOCOMPARE_KEY", ""))
+    isempty(key) || return key
+    isfile(CRYPTOCOMPARE_KEY_FILE) ||
+        error("missing API key: set CRYPTOCOMPARE_KEY or put it in $CRYPTOCOMPARE_KEY_FILE")
+    return strip(read(CRYPTOCOMPARE_KEY_FILE, String))
+end
 
 # ==============================================================================
 # Data Fetch (CRYPTOCOMPARE - PORT Z PYTHONA)
 # ==============================================================================
 """
 Downloades historical data from z CryptoCompare, from start_date to current time.
-
+Returns (ok, rows, message); `message` holds the API error if the download stopped early.
 """
 function update_from_cryptocompare!(filepath="./data/btc_cryptocompare.csv"; start_date=Dates.DateTime(2008, 1, 1))
     symbol = "BTC"
@@ -39,8 +50,10 @@ function update_from_cryptocompare!(filepath="./data/btc_cryptocompare.csv"; sta
     
     all_dfs = DataFrames.DataFrame[]
     current_end_ts = end_ts
+    api_error = nothing
     
     try
+        api_key = cryptocompare_key()
         while current_end_ts > start_ts
             url = "https://min-api.cryptocompare.com/data/v2/histohour"
             params = [
@@ -48,16 +61,16 @@ function update_from_cryptocompare!(filepath="./data/btc_cryptocompare.csv"; sta
                 "tsym" => "USD",
                 "limit" => string(limit),
                 "toTs" => string(current_end_ts),
-                "api_key" => CRYPTOCOMPARE_KEY
             ]
             
-            # Wysłanie zapytania
+            # Wysłanie zapytania; the key goes in a header so it stays out of URL logs.
             query_str = join(["$k=$v" for (k,v) in params], "&")
-            response = HTTP.get(url * "?" * query_str)
+            response = HTTP.get(url * "?" * query_str, ["authorization" => "Apikey $api_key"])
             data = JSON.parse(String(response.body))
             
             if data["Response"] != "Success"
                 println("Błąd API: $(data["Message"])")
+                api_error = data["Message"]
                 break
             end
             
@@ -104,10 +117,12 @@ function update_from_cryptocompare!(filepath="./data/btc_cryptocompare.csv"; sta
             mkpath(dirname(filepath))
             CSV.write(filepath, final_df)
             println("Sukces! Zapisano $(size(final_df, 1)) rekordów do $filepath")
+            return (ok=true, rows=size(final_df, 1), message=something(api_error, "complete"))
         end
-        
+        return (ok=false, rows=0, message=something(api_error, "no data received"))
     catch e
         println("Wystąpił błąd: $e")
+        return (ok=false, rows=0, message=sprint(showerror, e))
     end
 end
 
@@ -123,50 +138,71 @@ end
 # ==============================================================================
 # Funkcja przygotowuje manifest (przestrzeń fazową) dla konkretnego punktu w czasie.
 # 'backSize' określa przesunięcie od końca danych w celu przeprowadzenia testu.
-function run(backSize; windowSize=82000, msize=10)
-    # Pobieranie danych i dodawanie jittera (szumu zapobiegającego błędom k-NN).
-    mydf = NumberCruncher.DataManager.LoadData("./data/btc_cryptocompare.csv")
-    NumberCruncher.DataManager.AddDeltas!(mydf)
-    
+# Works on any prepared series s (price deltas, a Lorenz coordinate, ...).
+# Pass a seeded `rng` (e.g. Xoshiro(seed)) to make the jitter, and so the result, reproducible.
+# `jitter` is relative to the window's std: quantised data (prices in cents, pressure in 0.1 hPa)
+# has exact duplicates, and an absolute 1e-10 is too small for PECUZAL on values near 1000.
+function run_series(s::AbstractVector{<:Real}, backSize; windowSize=82000, msize=10, jitter=1e-8,
+                    rng::AbstractRNG=Random.default_rng())
     # Określenie okna czasowego obserwacji.
-    windowStart = floor(max(1, length(mydf.deltaOJittered) - backSize - windowSize))
-    dataOJit = mydf.deltaOJittered[windowStart:end-backSize]
+    windowStart = max(1, length(s) - backSize - windowSize)
+    window = s[windowStart:end-backSize]
+    # Dodawanie jittera (szumu zapobiegającego błędom k-NN).
+    scale = std(window) > 0 ? std(window) : 1.0
+    dataOJit = window .+ (jitter * scale) .* randn(rng, length(window))
 
     # Estymacja opóźnienia (Theiler window) za pomocą wzajemnej informacji.
     theiler = estimate_delay(dataOJit, "mi_min")
 
     # Rekonstrukcja przestrzeni fazowej algorytmem PECUZAL.
     Y, tau_vals, ts_vals, Ls, epss = pecuzal_embedding(dataOJit; τs=0:msize, w=theiler, econ=true, verbose=false)
+    # With no embedding gain PECUZAL returns the raw series (tau_vals=[0]); keep Y m-dimensional.
+    Y = StateSpaceSet(Y)
 
     # Wyodrębnienie rzeczywistych punktów historycznych do późniejszej walidacji.
     # Y[n] = (s[n+τ₁], …, s[n+τₘ]), so coordinate j of the next point Y[end+1]
     # is s[N+1-(τmax-τⱼ)]; the τmax coordinate is the future value s[N+1].
     tmax = maximum(tau_vals)
-    realPoint = [mydf.deltaO[end-backSize+1-(tmax-t)] for t in tau_vals]
-    
-    return (Y=Y, tau_vals=tau_vals, ts_vals=ts_vals, Ls=Ls, epss=epss, DTFrame=mydf, dataOJit=dataOJit, realPoint=realPoint)
+    realPoint = [s[end-backSize+1-(tmax-t)] for t in tau_vals]
+
+    return (Y=Y, tau_vals=tau_vals, ts_vals=ts_vals, Ls=Ls, epss=epss, theiler=theiler, dataOJit=dataOJit, realPoint=realPoint)
 end
+
+const DEFAULT_DATAFILE = joinpath(@__DIR__, "..", "data", "btc_cryptocompare.csv")
+
+# Loads a CryptoCompare-style CSV and adds the deltaO/deltaC columns.
+function load_deltas(datafile=DEFAULT_DATAFILE; rng::AbstractRNG=Random.default_rng())
+    mydf = NumberCruncher.DataManager.LoadData(datafile)
+    NumberCruncher.DataManager.AddDeltas!(mydf; rng=rng)
+    return mydf
+end
+
+# The original BTC pipeline: hourly open-price deltas from a CryptoCompare CSV.
+function reconstruct(backSize; windowSize=82000, msize=10, datafile=DEFAULT_DATAFILE,
+                     rng::AbstractRNG=Random.default_rng())
+    mydf = load_deltas(datafile; rng=rng)
+    r = run_series(mydf.deltaO, backSize; windowSize=windowSize, msize=msize, rng=rng)
+    return merge(r, (DTFrame=mydf,))
+end
+
+# Old name, kept for existing scripts (`NumberCruncher.run(...)`).
+run(args...; kwargs...) = reconstruct(args...; kwargs...)
 
 # ==============================================================================
 # NEIGHBOURHOOD ANALYSIS & PREDICTION
 # ==============================================================================
 
-# Wersja 1: Estymacja na podstawie jednego znanego wymiaru (X).
-function analyzeit(Y, df, taus, backSize)
-    neighs = NumberCruncher.Analysis.find_neighbours(Y[begin:end-2], Y[end])
-    tau = maximum(taus)
-    center = NumberCruncher.Analysis.weighted_center(
-        Y[neighs.idxs .+ 1],
-        neighs.dists,
-        df.deltaO[end-backSize-tau+1],
-        nothing
-    )
-    return (center=center, neigs=neighs)
-end
+# Estimates the next point of the m-dimensional reconstruction from k neighbours.
+analyzeit2(Y, df::DataFrame, taus, backSize; kwargs...) = analyzeit2(Y, df.deltaO, taus, backSize; kwargs...)
 
-# Wersja 2: Bardziej zaawansowana estymacja wektorowa (używana w głównej pętli).
-function analyzeit2(Y, df, taus, backSize)
-    neighs = NumberCruncher.Analysis.find_neighbours(Y[begin:end-2], Y[end])
+# s is the prepared series the reconstruction Y was built from.
+# theiler: states closer than this in time to Y[end] lie on the same stretch of trajectory
+# and are not real neighbours; pass the w from run_series. The default 1 keeps the old Y[1:end-2].
+function analyzeit2(Y, s::AbstractVector, taus, backSize; k=Analysis.DEFAULT_K, theiler::Integer=1)
+    nsearch = length(Y) - 1 - theiler
+    nsearch >= 1 || throw(ArgumentError("Theiler window $theiler leaves no candidate neighbours"))
+    k = min(k, nsearch)
+    neighs = NumberCruncher.Analysis.find_neighbours(Y[begin:nsearch], Y[end], k)
     tLen = length(taus)
     
     # Przygotowanie wektora referencyjnego z uwzględnieniem brakujących współrzędnych (nothing).
@@ -178,7 +214,7 @@ function analyzeit2(Y, df, taus, backSize)
     idx = argmax(taus)
     for j in 1:tLen
         if j != idx
-            rPoint[j] = df.deltaO[end-backSize+1-(tmax-taus[j])]
+            rPoint[j] = s[end-backSize+1-(tmax-taus[j])]
         end
     end
     
@@ -194,10 +230,11 @@ end
 # ==============================================================================
 # THE GLOBAL SIMULATION (GRID SEARCH)
 # ==============================================================================
-function do_the_thing(backRange=1000:-20:10, neighRange=2:5:1000)
-    nthreads = Threads.nthreads()
-    # Buforowanie wyników na poziomie wątków dla uniknięcia "race conditions".
-    results_threads = [Vector{NamedTuple}() for _ in 1:nthreads]
+function do_the_thing(backRange=1000:-20:10, neighRange=2:5:1000; seed=1, datafile=DEFAULT_DATAFILE)
+    # Tasks can migrate between threads, so collect under a lock, not per threadid().
+    results_all = Vector{NamedTuple}()
+    results_lock = ReentrantLock()
+    mydf = load_deltas(datafile)
 
     # Wielowątkowa pętla po zakresie testowym czasu.
     Threads.@threads for ix in 1:length(backRange)
@@ -206,35 +243,38 @@ function do_the_thing(backRange=1000:-20:10, neighRange=2:5:1000)
  
         # Przeszukiwanie różnych parametrów osadzania (msize).
         for tausize in 5:10:100
-            r0 = run(x, msize=tausize)
+            r0 = run_series(mydf.deltaO, x; msize=tausize, rng=Xoshiro(hash((seed, x, tausize))))
             println(r0.tau_vals)
 
             # Testowanie czułości modelu na liczbę sąsiadów (k).
             for y in neighRange
-                y_actual = min(y, length(r0.Y)-1)
-                Analysis.neighs = y_actual 
+                # The tree holds Y[1:end-1-theiler].
+                y_actual = min(y, length(r0.Y) - 1 - r0.theiler)
 
                 # Wykonanie prognozy.
-                r1 = analyzeit2(r0.Y, r0.DTFrame, r0.tau_vals, x)
+                r1 = analyzeit2(r0.Y, mydf.deltaO, r0.tau_vals, x; k=y_actual, theiler=r0.theiler)
 
+                # est_x/real_x is the unknown (largest-delay) coordinate; est/real keep all m.
                 push!(local_results, (
                     m_size=tausize,
                     time = x,
                     neighs = y_actual,
-                    est_x = r1.center[1],
-                    est_y = r1.center[2],
-                    real_x = r0.realPoint[1],
-                    real_y = r0.realPoint[2],
+                    taus = r0.tau_vals,
+                    searched_index = r1.searchedIndex,
+                    est_x = r1.center[r1.searchedIndex],
+                    real_x = r0.realPoint[r1.searchedIndex],
+                    est = r1.center,
+                    real = r0.realPoint,
                 ))
             end
         end
-        append!(results_threads[threadid()], local_results)
+        lock(results_lock) do
+            append!(results_all, local_results)
+        end
     end
-    
-    # Agregacja i obliczenie błędu euklidesowego.
-    results_all = vcat(results_threads...)
+
     df = DataFrame(results_all)
-    df.dists = sqrt.((df.est_x .- df.real_x).^2 .+ (df.est_y .- df.real_y).^2)
+    df.dists = abs.(df.est_x .- df.real_x)
     return df
 end
 
@@ -243,8 +283,12 @@ end
 # WALK-FORWARD VALIDATION (THE THING 2)
 # ==============================================================================
 # Sequentially analyses the last N points to evaluate predictive performance.
-function do_the_thing2(n_points=100, tausize=30, k_neighs=50)
+# Each point gets its own seeded jitter, so a run is reproducible for a given seed.
+function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=DEFAULT_DATAFILE,
+                       windowSize=82000)
     backRange = n_points:-1:1
+    mydf = load_deltas(datafile)
+    s = mydf.deltaO
     
     # Thread-safe container
     results_all_vec = Vector{NamedTuple}()
@@ -258,28 +302,34 @@ function do_the_thing2(n_points=100, tausize=30, k_neighs=50)
         # Logging progress
         println("Processing point: $x")
         
-        # Use a local copy of parameters or set them safely
-        Analysis.neighs = k_neighs 
-        r0 = run(x)
-        
+        r0 = run_series(s, x; windowSize=windowSize, msize=tausize, rng=Xoshiro(hash((seed, x))))
+
         println("Executing state estimation for offset: $x")
-        r1 = analyzeit2(r0.Y, r0.DTFrame, r0.tau_vals, x)
-        #idx_now = argmax(r0.tau_vals)
+        r1 = analyzeit2(r0.Y, s, r0.tau_vals, x; k=k_neighs, theiler=r0.theiler)
         println("iAfter analysis, offset: $x, idx $(r1.searchedIndex) tau vals: $(r0.tau_vals) est: $(r1.center) real: $(r0.realPoint)")
         lock(results_lock) do
             push!(results_all_vec, (
                 time_offset = x,
+                taus = r0.tau_vals,
+                theiler = r0.theiler,
+                searched_index = r1.searchedIndex,
                 est_x = r1.center[r1.searchedIndex],
                 real_x = r0.realPoint[r1.searchedIndex],
+                persistence_x = s[end-x],          # baseline: the last known delta
+                est = r1.center,
+                real = r0.realPoint,
             ))
         end
     end
 
     df = DataFrame(results_all_vec)
     sort!(df, :time_offset, rev=true)
-    df.dists = sqrt.((df.est_x .- df.real_x).^2)
+    df.dists = abs.(df.est_x .- df.real_x)
     return df
 end
+
+# Skill of a do_the_thing2 result against the zero and persistence predictors.
+summarize(df::DataFrame) = Analysis.skill_summary(df.est_x, df.real_x, df.persistence_x)
 
 
 
@@ -398,5 +448,11 @@ function plot_aesthetic_analysis(df)
 end
 
 
+
+# ==============================================================================
+# BROWSER GUI
+# ==============================================================================
+include("GUI/GUI.jl")
+using .GUI: serve_gui
 
 end # Closes module NumberCruncher

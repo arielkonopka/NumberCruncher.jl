@@ -21,6 +21,8 @@ The main purpose of this project is to **create a data estimator**.
    git clone https://github.com/arielkonopka/NumberCruncher.jl.git
    ```
 
+   Only the Bitcoin download needs a [CryptoCompare](https://min-api.cryptocompare.com/) API key. Set the `CRYPTOCOMPARE_KEY` environment variable, or copy `config/cryptocompare_key.txt.example` to `config/cryptocompare_key.txt` and put the key in it, alone on one line (that file is git-ignored; never commit it).
+
 3. **Run Julia**  
    Start Julia in the project directory and enter package mode:
    ```julia
@@ -41,16 +43,39 @@ The main purpose of this project is to **create a data estimator**.
    Back in Julia REPL:
    ```julia
    using NumberCruncher
-   r = NumberCruncher.do_the_thing()
+   r = do_the_thing2(100, 30, 50; seed=1)   # last 100 points, max delay 30, k = 50
+   summarize(r)                              # skill vs. the zero and persistence predictors
    ```
 
 7. **Now you got the data**
-*r* variable contains the dataframe, that was created during the "do_the_thing" function run. You can speed upp your calculations by increasing the number of the threads by invoking:
+*r* variable contains the dataframe, that was created during the "do_the_thing2" function run: the estimate and the real value of each hidden point, the persistence baseline, the delays and the Theiler window. `summarize(r)` reports MAE against the zero predictor and persistence, the hit rate of the sign and its binomial p-value. The same `seed` gives the same result. `do_the_thing` runs the slower grid search over the embedding size and k. You can speed upp your calculations by increasing the number of the threads by invoking:
 
 ```bash
 julia -t threads
 ```
 Where *threads* is the number of concurrent instances, you would like to allow on your system.
+
+## 🖥️ Browser GUI
+
+```bash
+julia -t 6 --project=. -e 'using NumberCruncher; serve_gui()'
+```
+Then open <http://127.0.0.1:8080>. The GUI listens on localhost only (it has no authentication); pass `port=` to change the port.
+
+- **Data**: import stock and index prices (Yahoo Finance, unofficial endpoint), FRED series (`SP500`, `DJIA`, `VIXCLS`, …), hourly weather from the Open-Meteo archive, Bitcoin from CryptoCompare (needs the key), generate a Lorenz attractor, or upload any CSV. Every file lands in `data/`. A *dataset* is a file, a numeric column and a preparation: raw values, first differences or log returns, optionally with added noise.
+- **Run**: walk-forward test over the last *N* points, scoring several k values from each PECUZAL reconstruction; can be stopped.
+- **Results**: MAE, RMSE, hit rate and correlation against naive baselines (zero, persistence, window mean), estimate-vs-real and error charts, scores per embedding dimension, CSV export.
+- **Phase space**: the reconstruction at one offset in 2-D/3-D with the last point, its neighbours, their successors, the estimate and the real next point.
+
+The same pipeline works without the GUI on any series:
+```julia
+using NumberCruncher
+L = NumberCruncher.DataManager.GenerateLorenz(N=20000, Δt=0.01)
+s = NumberCruncher.Preprocessor.prepare_series(L.x; transform=:raw).series
+r = run_series(s, 1; msize=40)                  # hold out the last value
+e = NumberCruncher.analyzeit2(r.Y, s, r.tau_vals, 1; k=30)
+e.center[e.searchedIndex], r.realPoint[e.searchedIndex]   # estimate, real
+```
 
 ## Your PC's Personal Workout: A High-Intensity Benchmark
 

@@ -142,8 +142,12 @@ end
 # Pass a seeded `rng` (e.g. Xoshiro(seed)) to make the jitter, and so the result, reproducible.
 # `jitter` is relative to the window's std: quantised data (prices in cents, pressure in 0.1 hPa)
 # has exact duplicates, and an absolute 1e-10 is too small for PECUZAL on values near 1000.
+#
+# samplesize < 1 lets PECUZAL evaluate only that fraction of points (much faster, but it can pick
+# other delays); its subsample is seeded from `rng`. `embedding` = (tau_vals, theiler) skips
+# PECUZAL and only builds the delay vectors of this window (see EmbeddingBlocks).
 function run_series(s::AbstractVector{<:Real}, backSize; windowSize=82000, msize=10, jitter=1e-8,
-                    rng::AbstractRNG=Random.default_rng())
+                    rng::AbstractRNG=Random.default_rng(), samplesize::Real=1.0, embedding=nothing)
     # Określenie okna czasowego obserwacji.
     windowStart = max(1, length(s) - backSize - windowSize)
     window = s[windowStart:end-backSize]
@@ -151,13 +155,23 @@ function run_series(s::AbstractVector{<:Real}, backSize; windowSize=82000, msize
     scale = std(window) > 0 ? std(window) : 1.0
     dataOJit = window .+ (jitter * scale) .* randn(rng, length(window))
 
-    # Estymacja opóźnienia (Theiler window) za pomocą wzajemnej informacji.
-    theiler = estimate_delay(dataOJit, "mi_min")
+    if embedding === nothing
+        # Estymacja opóźnienia (Theiler window) za pomocą wzajemnej informacji.
+        theiler = estimate_delay(dataOJit, "mi_min")
 
-    # Rekonstrukcja przestrzeni fazowej algorytmem PECUZAL.
-    Y, tau_vals, ts_vals, Ls, epss = pecuzal_embedding(dataOJit; τs=0:msize, w=theiler, econ=true, verbose=false)
-    # With no embedding gain PECUZAL returns the raw series (tau_vals=[0]); keep Y m-dimensional.
-    Y = StateSpaceSet(Y)
+        # PECUZAL draws its subsample from the task's default RNG: seed it from ours.
+        samplesize < 1 && Random.seed!(rand(rng, UInt64))
+        # Rekonstrukcja przestrzeni fazowej algorytmem PECUZAL.
+        Y, tau_vals, ts_vals, Ls, epss = pecuzal_embedding(dataOJit; τs=0:msize, w=theiler, econ=true,
+                                                           verbose=false, samplesize=samplesize)
+        # With no embedding gain PECUZAL returns the raw series (tau_vals=[0]); keep Y m-dimensional.
+        Y = StateSpaceSet(Y)
+    else
+        # Delays chosen earlier (from older data): only the delay vectors of this window are new.
+        tau_vals, theiler = embedding.tau_vals, embedding.theiler
+        Y = length(tau_vals) == 1 ? StateSpaceSet(dataOJit) : genembed(dataOJit, tau_vals)
+        ts_vals, Ls, epss = ones(Int, length(tau_vals)), Float64[], nothing
+    end
 
     # Wyodrębnienie rzeczywistych punktów historycznych do późniejszej walidacji.
     # Y[n] = (s[n+τ₁], …, s[n+τₘ]), so coordinate j of the next point Y[end+1]
@@ -166,6 +180,45 @@ function run_series(s::AbstractVector{<:Real}, backSize; windowSize=82000, msize
     realPoint = [s[end-backSize+1-(tmax-t)] for t in tau_vals]
 
     return (Y=Y, tau_vals=tau_vals, ts_vals=ts_vals, Ls=Ls, epss=epss, theiler=theiler, dataOJit=dataOJit, realPoint=realPoint)
+end
+
+"""
+    EmbeddingBlocks(s; every, windowSize, msize, seed, samplesize)
+
+Chooses the embedding (PECUZAL delays and the Theiler window) once per block of `every`
+consecutive offsets instead of once per point. Offset b belongs to the block whose anchor is
+the largest offset in it, cld(b, every)·every; the embedding is chosen on the window that ends
+at that anchor, i.e. before every point of the block, so no point sees its own future.
+Blocks are computed on demand, once, and shared between threads.
+"""
+struct EmbeddingBlocks
+    s::Vector{Float64}
+    every::Int
+    windowSize::Int
+    msize::Int
+    seed::Int
+    samplesize::Float64
+    tasks::Dict{Int,Task}
+    lock::ReentrantLock
+end
+
+EmbeddingBlocks(s; every, windowSize=82000, msize=10, seed=1, samplesize=1.0) =
+    EmbeddingBlocks(Vector{Float64}(s), every, windowSize, msize, seed, samplesize, Dict{Int,Task}(), ReentrantLock())
+
+anchor_offset(eb::EmbeddingBlocks, b) = cld(b, eb.every) * eb.every
+
+function embedding_for(eb::EmbeddingBlocks, b)
+    a = anchor_offset(eb, b)
+    t = lock(eb.lock) do
+        get!(eb.tasks, a) do
+            Threads.@spawn begin
+                r = run_series(eb.s, a; windowSize=eb.windowSize, msize=eb.msize, samplesize=eb.samplesize,
+                               rng=Xoshiro(hash((eb.seed, :anchor, a))))
+                (tau_vals=r.tau_vals, theiler=r.theiler, anchor=a)
+            end
+        end
+    end
+    return fetch(t)
 end
 
 const DEFAULT_DATAFILE = joinpath(@__DIR__, "..", "data", "btc_cryptocompare.csv")
@@ -199,12 +252,14 @@ analyzeit2(Y, df::DataFrame, taus, backSize; kwargs...) = analyzeit2(Y, df.delta
 # theiler: states closer than this in time to Y[end] lie on the same stretch of trajectory
 # and are not real neighbours; pass the w from run_series. The default 1 keeps the old Y[1:end-2].
 # shadow=false: plain k-NN analogues, weighted by the embedding distance only.
+# tree: optional KDTree of Y[1:end-1-theiler], shared between calls for different k.
 function analyzeit2(Y, s::AbstractVector, taus, backSize; k=Analysis.DEFAULT_K, theiler::Integer=1,
-                    shadow::Bool=true)
+                    shadow::Bool=true, tree=nothing)
     nsearch = length(Y) - 1 - theiler
     nsearch >= 1 || throw(ArgumentError("Theiler window $theiler leaves no candidate neighbours"))
     k = min(k, nsearch)
-    neighs = NumberCruncher.Analysis.find_neighbours(Y[begin:nsearch], Y[end], k)
+    neighs = tree === nothing ? Analysis.find_neighbours(Y[begin:nsearch], Y[end], k) :
+                                Analysis.find_neighbours(nothing, Y[end], k; tree=tree)
     tLen = length(taus)
     
     # Przygotowanie wektora referencyjnego z uwzględnieniem brakujących współrzędnych (nothing).
@@ -235,17 +290,23 @@ value and of its absolute value, with shadow weighting (known coordinates) and w
 Estimates are in the z scale; multiply by `scale` for the original scale (scale is 1 when
 the series is not normalised). The row also carries the truth and the naive baselines.
 """
+#
+# blocks: an EmbeddingBlocks of p.z to reuse block embeddings (nothing = PECUZAL for every point).
 function estimate_point(p::Preprocessor.PreparedSeries, b; ks=(Analysis.DEFAULT_K,), msize=10,
-                        windowSize=82000, seed=1)
+                        windowSize=82000, seed=1, samplesize=1.0, blocks=nothing)
     z = p.z
     n = length(z)
     t = n - b + 1
-    r0 = run_series(z, b; windowSize=windowSize, msize=msize, rng=Xoshiro(hash((seed, b))))
+    emb = blocks === nothing ? nothing : embedding_for(blocks, b)
+    r0 = run_series(z, b; windowSize=windowSize, msize=msize, rng=Xoshiro(hash((seed, b))),
+                    samplesize=samplesize, embedding=emb)
     win = (n - b - length(r0.dataOJit) + 1):(n - b)
     est = Dict{String,Any}()
     idx = argmax(r0.tau_vals)
+    # one tree for all k (building it per k cost more than the queries)
+    tree = KDTree(r0.Y[begin:max(1, length(r0.Y) - 1 - r0.theiler)])
     for k in ks
-        a = analyzeit2(r0.Y, z, r0.tau_vals, b; k=k, theiler=r0.theiler)
+        a = analyzeit2(r0.Y, z, r0.tau_vals, b; k=k, theiler=r0.theiler, tree=tree)
         w0 = Analysis.neighbour_weights(a.successors, a.neigs.dists, a.rPoint; shadow=false)
         est[string(k)] = (ret=a.center[idx], abs=Analysis.weighted_coordinate(a.successors, a.weights, idx; f=abs),
                           ret_ns=Analysis.weighted_coordinate(a.successors, w0, idx),
@@ -253,11 +314,16 @@ function estimate_point(p::Preprocessor.PreparedSeries, b; ks=(Analysis.DEFAULT_
                           center=a.center)
     end
     rw, zw = p.r[win], z[win]
+    P = p.period
     return (offset=b, label=string(p.labels[t]), m=length(r0.tau_vals), taus=r0.tau_vals,
+            anchor=emb === nothing ? b : emb.anchor,
             theiler=r0.theiler, searched_index=idx, real_point=r0.realPoint,
             real_r=p.r[t], last_r=p.r[t-1], real_z=z[t], last_z=z[t-1], scale=p.scale[t], ewma=p.ewma[t],
             win_mean_r=mean(rw), win_mean_abs_r=mean(abs, rw), win_mean_z=mean(zw), win_mean_abs_z=mean(abs, zw),
-            ar1_r=Analysis.ar1_forecast(rw, p.r[t-1]), ar1_z=Analysis.ar1_forecast(zw, z[t-1]), est=est)
+            ar1_r=Analysis.ar1_forecast(rw, p.r[t-1]), ar1_z=Analysis.ar1_forecast(zw, z[t-1]),
+            # seasonal persistence: the value one period earlier (same time yesterday for hourly data)
+            seasonal_r=P > 0 && t > P ? p.r[t-P] : NaN, seasonal_z=P > 0 && t > P ? z[t-P] : NaN,
+            est=est)
 end
 
 # ==============================================================================
@@ -270,7 +336,8 @@ function do_the_thing(backRange=1000:-20:10, neighRange=2:5:1000; seed=1, datafi
     mydf = load_deltas(datafile)
 
     # Wielowątkowa pętla po zakresie testowym czasu.
-    Threads.@threads for ix in 1:length(backRange)
+    # :greedy hands out points one by one: their cost varies several-fold with the embedding.
+    Threads.@threads :greedy for ix in 1:length(backRange)
         x = backRange[ix]
         local_results = Vector{NamedTuple}() 
  
@@ -323,24 +390,36 @@ end
 # normalize=:ewma/:rolling embeds volatility-normalised values z = r/σ (σ ex-ante) and converts
 # estimates back with σ; all scores stay in the original scale (est_z/real_z add the z scale).
 # target=:abs_return estimates |r| instead of r; shadow=false uses plain k-NN weights.
+# period (:auto = samples per day from the timestamps, e.g. 24 for hourly data) adds the seasonal
+# persistence baseline "same time one period earlier"; transform=:sdiff removes that cycle first.
+# reembed_every=B runs PECUZAL once per block of B points (on data before the block) instead of
+# for every point; samplesize < 1 makes PECUZAL subsample (both much faster, both change results).
 function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=DEFAULT_DATAFILE,
                        windowSize=82000, column=:open, transform::Symbol=:diff,
                        aggregate::Symbol=:none, stat::Symbol=:mean,
                        normalize::Symbol=:none, ewma_lambda=0.98, vol_window=168, vol_burnin=500,
-                       target::Symbol=:return, shadow::Bool=true)
+                       target::Symbol=:return, shadow::Bool=true, period=:auto,
+                       reembed_every::Integer=1, samplesize::Real=1.0)
     target in (:return, :abs_return) || throw(ArgumentError("target must be :return or :abs_return"))
+    # Auto-detection only for sub-daily data; after daily resampling pass e.g. period=7 explicitly.
+    autoperiod(l) = period == :auto ? (aggregate == :none ? Preprocessor.detect_period(l) : 0) : Int(period)
     if aggregate == :none && column == :open && transform == :diff
         mydf = load_deltas(datafile)            # the original hourly deltaO series
         s, labels = mydf.deltaO, DataManager.RowLabels(mydf)
+        P = autoperiod(labels)
     else
         raw = DataManager.LoadData(datafile)
-        prep = Preprocessor.prepare_series(raw[!, column], DataManager.RowLabels(raw);
-                                           aggregate=aggregate, stat=stat, transform=transform)
+        rawlabels = DataManager.RowLabels(raw)
+        P = autoperiod(rawlabels)
+        prep = Preprocessor.prepare_series(raw[!, column], rawlabels; aggregate=aggregate, stat=stat,
+                                           transform=transform, period=P)
         s, labels = prep.series, prep.labels
     end
     p = Preprocessor.normalize_series(s, labels; normalize=normalize, ewma_lambda=ewma_lambda,
-                                      vol_window=vol_window, vol_burnin=vol_burnin)
+                                      vol_window=vol_window, vol_burnin=vol_burnin, period=P)
     n_points <= length(p.z) ÷ 2 || throw(ArgumentError("only $(length(p.z)) values; test at most $(length(p.z) ÷ 2) points"))
+    blocks = reembed_every > 1 ? EmbeddingBlocks(p.z; every=reembed_every, windowSize=windowSize, msize=tausize,
+                                                 seed=seed, samplesize=samplesize) : nothing
     backRange = n_points:-1:1
 
     # Thread-safe container
@@ -349,10 +428,12 @@ function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=D
 
     println("Commencing walk-forward analysis for $n_points points using $(nthreads()) threads...")
 
-    Threads.@threads for ix in 1:length(backRange)
+    # :greedy hands out points one by one: their cost varies several-fold with the embedding.
+    Threads.@threads :greedy for ix in 1:length(backRange)
         x = backRange[ix]
         println("Processing point: $x")
-        e = estimate_point(p, x; ks=(k_neighs,), msize=tausize, windowSize=windowSize, seed=seed)
+        e = estimate_point(p, x; ks=(k_neighs,), msize=tausize, windowSize=windowSize, seed=seed,
+                           samplesize=samplesize, blocks=blocks)
         v = e.est[string(k_neighs)]
         ez = target == :return ? (shadow ? v.ret : v.ret_ns) : (shadow ? v.abs : v.abs_ns)
         f = target == :return ? identity : abs
@@ -368,6 +449,7 @@ function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=D
                 persistence_x = f(e.last_r),        # baseline: the last known value
                 ar1_x = e.ar1_r,
                 ewma_x = e.ewma * sqrt(2 / π),      # baseline for |r|: expected |r| under N(0, σ²)
+                seasonal_x = f(e.seasonal_r),       # baseline: same time one period earlier
                 est_z = ez,
                 real_z = f(e.real_z),
                 sigma = e.scale,
@@ -388,11 +470,12 @@ end
 # Skill of a do_the_thing2 result against the naive predictors (zero, persistence and AR(1)
 # for returns; EWMA and persistence for |r|).
 function summarize(df::DataFrame)
+    seasonal = "seasonal_x" in names(df) && all(isfinite, df.seasonal_x) ? df.seasonal_x : nothing
     if metadata(df, "target", "return") == "abs_return"
-        return Analysis.abs_skill_summary(df.est_x, df.real_x, df.persistence_x, df.ewma_x)
+        return Analysis.abs_skill_summary(df.est_x, df.real_x, df.persistence_x, df.ewma_x; seasonal=seasonal)
     end
     return Analysis.skill_summary(df.est_x, df.real_x, df.persistence_x;
-                                  ar1="ar1_x" in names(df) ? df.ar1_x : nothing)
+                                  ar1="ar1_x" in names(df) ? df.ar1_x : nothing, seasonal=seasonal)
 end
 
 

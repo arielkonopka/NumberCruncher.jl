@@ -124,7 +124,9 @@ code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size:
           <option value="raw">raw values</option>
           <option value="diff">first differences</option>
           <option value="logdiff">log returns</option>
+          <option value="sdiff">seasonal differences (minus same time 1 season earlier)</option>
         </select></label>
+        <label>Season (samples)<input id="ds-period" value="auto" style="width:90px"></label>
         <label>Added noise (× std)<input id="ds-noise" type="number" min="0" max="10" step="0.01" value="0"></label>
       </div>
       <div class="row">
@@ -140,7 +142,7 @@ code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size:
         <label>Burn-in<input id="ds-burnin" type="number" value="500" min="0" disabled></label>
         <button class="btn" id="ds-apply">Use dataset</button>
       </div>
-      <p class="hint" id="ds-hint">Prices: log returns. Weather or Lorenz: raw values (or differences). Resampling (e.g. daily mean) runs before the preparation and needs a date/time column; incomplete days or weeks are dropped. Volatility normalisation divides changes by a past-only volatility estimate σ<sub>t</sub> (it never uses the value it scales), embeds z = r/σ and converts estimates back with σ; scores stay in the original scale. Noise tests robustness on clean data.</p>
+      <p class="hint" id="ds-hint">Prices: log returns. Weather or Lorenz: raw values (or differences). Resampling (e.g. daily mean) runs before the preparation and needs a date/time column; incomplete days or weeks are dropped. The season is the number of samples per cycle (auto: per day, i.e. 24 for hourly data); it adds the baseline “same time, 1 period earlier” and is the lag of seasonal differences, which remove the daily sun cycle before embedding. Volatility normalisation divides changes by a past-only volatility estimate σ<sub>t</sub> (it never uses the value it scales), embeds z = r/σ and converts estimates back with σ; scores stay in the original scale. Noise tests robustness on clean data.</p>
       <div class="msg" id="ds-msg"></div>
       <div id="ds-summary"></div>
       <div id="ds-preview" class="plot" style="display:none"></div>
@@ -253,6 +255,11 @@ code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size:
       <label>Window<input id="run-window" type="number" value="82000" min="100"></label>
       <label>Seed<input id="run-seed" type="number" value="1" step="1"></label>
     </div>
+    <div class="row">
+      <label>Re-embed every (points)<input id="run-every" type="number" value="1" min="1"></label>
+      <label>PECUZAL sample size<input id="run-samplesize" type="number" value="1" min="0.01" max="1" step="0.05"></label>
+    </div>
+    <p class="hint">Speed-ups (both change results; 1 and 1 reproduce the exact per-point method): <em>re-embed every B</em> chooses delays and Theiler window once per block of B points, from data before the block, then only rebuilds the delay vectors per point; <em>sample size</em> &lt; 1 lets PECUZAL evaluate only that fraction of points (seeded, so still reproducible).</p>
     <div class="row">
       <button class="btn" id="run-start">Start</button>
       <button class="btn danger" id="run-stop" disabled>Stop</button>

@@ -116,6 +116,7 @@ function dataset_summary(d::Dataset)
             aggregate=string(d.aggregate), stat=string(d.stat),
             normalize=string(d.prep.normalize), normalization=normalization_name(d),
             burnin=d.prep.vol_burnin, z_std=d.prep.normalize == :none ? nothing : std(d.prep.z),
+            period=d.prep.period, period_regularity=map(nanless, PP.seasonal_regularity(labels, d.prep.period)),
             length=length(s), mean=mean(s), std=std(s), min=minimum(s), max=maximum(s),
             first=labels[1], last=labels[end],
             preview=(index=collect(idx), labels=labels[idx], values=s[idx]))
@@ -126,16 +127,22 @@ end
 # ==============================================================================
 # The jitter is seeded per offset, so a run is reproducible and independent of thread order.
 # Every variant (k, return/|return|, shadow on/off) comes from one reconstruction.
-evaluate_point(d::Dataset, b, ks, msize, window, seed) =
-    NC.estimate_point(d.prep, b; ks=ks, msize=msize, windowSize=window, seed=seed)
+evaluate_point(d::Dataset, b, ks, msize, window, seed; samplesize=1.0, blocks=nothing) =
+    NC.estimate_point(d.prep, b; ks=ks, msize=msize, windowSize=window, seed=seed,
+                      samplesize=samplesize, blocks=blocks)
 
 function run_job!(job::RunJob, ks, msize, window, seed)
     n = job.total
+    samplesize = job.params["samplesize"]
+    every = job.params["reembed_every"]
+    blocks = every > 1 ? NC.EmbeddingBlocks(job.dataset.prep.z; every=every, windowSize=window,
+                                            msize=msize, seed=seed, samplesize=samplesize) : nothing
     try
-        Threads.@threads for b in n:-1:1
+        # :greedy hands out points one by one: their cost varies several-fold with the embedding.
+        Threads.@threads :greedy for b in n:-1:1
             job.cancel[] && continue
             try
-                r = evaluate_point(job.dataset, b, ks, msize, window, seed)
+                r = evaluate_point(job.dataset, b, ks, msize, window, seed; samplesize=samplesize, blocks=blocks)
                 lock(job.lock) do
                     push!(job.results, r)
                 end
@@ -203,6 +210,9 @@ function view_series(res, ks; target=:return, scale=:r, ablation=false, raw=fals
         # Predicting 0 only makes sense for changes, not for raw levels like a temperature.
         raw || pushfirst!(baselines, "zero" => zeros(length(res)))
     end
+    # Same time one period earlier (e.g. yesterday at this hour): knows the daily cycle.
+    seasonal = [f(scale == :r ? r.seasonal_r : r.seasonal_z) for r in res]
+    all(isfinite, seasonal) && push!(baselines, "same time, 1 period earlier" => seasonal)
     return (real=real, last=last, knn=knn, baselines=baselines)
 end
 
@@ -253,9 +263,9 @@ function job_status(job; target=:return, scale=:r, ablation=false)
             metrics=metrics(res, ks, raw; target=target, scale=scale, ablation=ablation), results=rows)
 end
 
-function phase_space(d::Dataset, b, msize, window, k, seed)
+function phase_space(d::Dataset, b, msize, window, k, seed; samplesize=1.0)
     s = d.prep.z
-    r0 = NC.run_series(s, b; windowSize=window, msize=msize, rng=Xoshiro(hash((seed, b))))
+    r0 = NC.run_series(s, b; windowSize=window, msize=msize, rng=Xoshiro(hash((seed, b))), samplesize=samplesize)
     Y = r0.Y
     r1 = NC.analyzeit2(Y, s, r0.tau_vals, b; k=k, theiler=r0.theiler)
     idx = downsample(length(Y), 4000)
@@ -289,6 +299,7 @@ function post_dataset(req)
     aggregate = Symbol(get(p, "aggregate", "none"))
     stat = Symbol(get(p, "stat", "mean"))
     normalize = Symbol(get(p, "normalize", "none"))
+    period_in = string(get(p, "period", "auto"))
     λ = getnum(p, "ewma_lambda", 0.98)
     vol_window = getnum(p, "vol_window", 168, Int)
     burnin = getnum(p, "vol_burnin", 500, Int)
@@ -299,10 +310,15 @@ function post_dataset(req)
     d = onworker() do
         df = DM.LoadData(path)
         column in names(df) || throw(ArgumentError("column '$column' not in $(basename(path))"))
-        prep = PP.prepare_series(df[!, column], DM.RowLabels(df); transform=transform,
-                                 aggregate=aggregate, stat=stat, noise=noise)
+        rowlabels = DM.RowLabels(df)
+        # auto: samples per day for sub-daily data (24 for hourly), none after resampling
+        P = period_in in ("auto", "") ? (aggregate == :none ? PP.detect_period(rowlabels) : 0) :
+            parse(Int, period_in)
+        P >= 0 || throw(ArgumentError("the season must be a number of samples ≥ 0"))
+        prep = PP.prepare_series(df[!, column], rowlabels; transform=transform,
+                                 aggregate=aggregate, stat=stat, noise=noise, period=P)
         np = PP.normalize_series(prep.series, prep.labels; normalize=normalize, ewma_lambda=λ,
-                                 vol_window=vol_window, vol_burnin=burnin)
+                                 vol_window=vol_window, vol_burnin=burnin, period=P)
         Dataset(basename(path), column, transform, aggregate, stat, noise, np)
     end
     DATASET[] = d
@@ -403,11 +419,16 @@ function post_run(req)
         msize = getnum(p, "msize", 10, Int)
         window = getnum(p, "window", 82000, Int)
         seed = getnum(p, "seed", 1, Int)
+        every = getnum(p, "reembed_every", 1, Int)
+        samplesize = getnum(p, "samplesize", 1.0)
+        every >= 1 || throw(ArgumentError("re-embed every must be at least 1 point"))
+        0 < samplesize <= 1 || throw(ArgumentError("PECUZAL sample size must be in (0, 1]"))
         1 <= n <= length(d.prep.z) ÷ 2 || throw(ArgumentError("points to test must be between 1 and $(length(d.prep.z) ÷ 2)"))
         !isempty(ks) && all(>=(1), ks) || throw(ArgumentError("k values must be positive"))
         1 <= msize <= 200 || throw(ArgumentError("max delay must be between 1 and 200"))
         window >= 100 || throw(ArgumentError("window must be at least 100"))
-        params = Dict{String,Any}("n_points" => n, "ks" => ks, "msize" => msize, "window" => window, "seed" => seed)
+        params = Dict{String,Any}("n_points" => n, "ks" => ks, "msize" => msize, "window" => window, "seed" => seed,
+                                  "reembed_every" => every, "samplesize" => samplesize)
         job = RunJob(params, d, n, Atomic{Int}(0), Atomic{Int}(0), Atomic{Bool}(false),
                      :running, "", NamedTuple[], now(), nothing, ReentrantLock())
         JOB[] = job
@@ -436,7 +457,8 @@ function post_phase(req)
     b = getnum(p, "offset", 1, Int)
     1 <= b <= length(d.prep.z) ÷ 2 || throw(ArgumentError("offset out of range"))
     r = onworker(() -> phase_space(d, b, getnum(p, "msize", 10, Int), getnum(p, "window", 82000, Int),
-                                   getnum(p, "k", 50, Int), getnum(p, "seed", 1, Int)))
+                                   getnum(p, "k", 50, Int), getnum(p, "seed", 1, Int);
+                                   samplesize=getnum(p, "samplesize", 1.0)))
     return json_response(r)
 end
 

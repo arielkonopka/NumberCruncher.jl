@@ -44,10 +44,10 @@ end
 
 
 
-function find_neighbours(spaceSet,point,k=DEFAULT_K)
-    tree=KDTree(spaceSet)
+# Pass a prebuilt `tree` (of spaceSet) to query several k without rebuilding it.
+function find_neighbours(spaceSet,point,k=DEFAULT_K; tree=KDTree(spaceSet))
     idxes,dists=knn(tree,point,k)
-    return (idxs=idxes,dists=dists,NSet=spaceSet[idxes],tree=tree)
+    return (idxs=idxes,dists=dists,tree=tree)
 end
 
 """
@@ -56,12 +56,14 @@ the correlation, and the share of points where the model's error is below the EW
 (the hit rate is meaningless for |r|).
 """
 function abs_skill_summary(est::AbstractVector, real::AbstractVector, last::AbstractVector,
-                           ewma::AbstractVector)
+                           ewma::AbstractVector; seasonal::Union{AbstractVector,Nothing}=nothing)
     mae(e) = mean(abs.(e .- real))
-    return (n=length(real), mae=mae(est), mae_ewma=mae(ewma), mae_persistence=mae(last),
+    base = (n=length(real), mae=mae(est), mae_ewma=mae(ewma), mae_persistence=mae(last),
             skill_ewma=1 - mae(est) / mae(ewma), skill_persistence=1 - mae(est) / mae(last),
             corr=cor(est, real), corr_ewma=cor(ewma, real),
             beats_ewma=mean(abs.(est .- real) .< abs.(ewma .- real)))
+    seasonal === nothing && return base
+    return merge(base, (mae_seasonal=mae(seasonal), skill_seasonal=1 - mae(est) / mae(seasonal)))
 end
 
 """
@@ -92,6 +94,7 @@ Parameters:
 - est, real: estimated and real values
 - last: the last known value before each estimated one (the persistence forecast)
 - ar1: optional AR(1) forecasts (see ar1_forecast) to score against as well
+- seasonal: optional seasonal persistence forecasts (the value one period earlier)
 
 Returns:
 - NamedTuple with MAE of the model, of the zero predictor and of persistence, the skills
@@ -99,7 +102,8 @@ Returns:
   and the binomial p-value of the hit rate against a coin flip
 """
 function skill_summary(est::AbstractVector, real::AbstractVector, last::AbstractVector;
-                       ar1::Union{AbstractVector,Nothing}=nothing)
+                       ar1::Union{AbstractVector,Nothing}=nothing,
+                       seasonal::Union{AbstractVector,Nothing}=nothing)
     mae(e) = mean(abs.(e .- real))
     ok = sign.(real) .!= 0
     hits = count(sign.(est[ok]) .== sign.(real[ok]))
@@ -109,8 +113,10 @@ function skill_summary(est::AbstractVector, real::AbstractVector, last::Abstract
             hit_rate=n == 0 ? NaN : hits / n,
             hit_rate_last_sign=n == 0 ? NaN : count(sign.(last[ok]) .== sign.(real[ok])) / n,
             hit_pvalue=binomial_pvalue(hits, n))
-    ar1 === nothing && return base
-    return merge(base, (mae_ar1=mae(ar1), skill_ar1=1 - mae(est) / mae(ar1)))
+    ar1 === nothing || (base = merge(base, (mae_ar1=mae(ar1), skill_ar1=1 - mae(est) / mae(ar1))))
+    seasonal === nothing ||
+        (base = merge(base, (mae_seasonal=mae(seasonal), skill_seasonal=1 - mae(est) / mae(seasonal))))
+    return base
 end
 
 

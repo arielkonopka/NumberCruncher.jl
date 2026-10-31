@@ -3,6 +3,7 @@ using Dates
 using Statistics
 
 export TRANSFORMS, AGGREGATES, STATS, NORMALIZATIONS, PreparedSeries, prepare_series, aggregate_series,
+       detect_period, seasonal_regularity,
        normalize_series, ewma_volatility, rolling_volatility
 
 """
@@ -10,8 +11,10 @@ Available preparation steps:
 - :raw     - the values as they are (e.g. a Lorenz coordinate)
 - :diff    - first differences v[i+1]-v[i] (what deltaO is for prices)
 - :logdiff - log returns log(v[i+1])-log(v[i]); needs positive values
+- :sdiff   - seasonal differences v[i]-v[i-P] (P = `period`, e.g. 24 for hourly data):
+             removes the daily cycle; "same time yesterday" becomes the zero predictor
 """
-const TRANSFORMS = (:raw, :diff, :logdiff)
+const TRANSFORMS = (:raw, :diff, :logdiff, :sdiff)
 
 """
 Resampling applied before the transform: :none, :daily or :weekly (weeks start on Monday)
@@ -32,6 +35,52 @@ function parse_time(x)
     str = string(x)
     occursin(r"^\d{4}-\d{2}-\d{2}", str) || return nothing
     return tryparse(DateTime, replace(str, " " => "T"))
+end
+
+"""
+Number of samples per day for regularly sampled sub-daily data (24 for hourly, 96 for
+15-minute data), or 0 when the labels are not dates or the spacing is a day or longer.
+"""
+function detect_period(labels::AbstractVector)
+    length(labels) < 3 && return 0
+    times = parse_time.(labels)
+    any(isnothing, times) && return 0
+    step = round(Int, median(Dates.value.(diff(sort(times)))))   # milliseconds
+    day = Dates.value(Millisecond(Day(1)))
+    return 0 < step < day && day % step == 0 ? day ÷ step : 0
+end
+
+"""
+How well the seasonal lag by position ("`period` samples earlier") matches the clock labels:
+- exact: share of lags whose labels are exactly one day apart
+- dst: share that are 23 or 25 hours apart, i.e. a daylight-saving switch in local-time labels;
+  the lag still spans 24 real hours of continuous sampling, so it is right for the sun cycle
+- other: the rest, real gaps or duplicates in the data, where the lag is wrong
+UTC data (all downloads here) has no DST shifts.
+"""
+function seasonal_regularity(labels::AbstractVector, period::Integer)
+    period > 0 && length(labels) > period || return (exact=NaN, dst=NaN, other=NaN)
+    times = parse_time.(labels)
+    any(isnothing, times) && return (exact=NaN, dst=NaN, other=NaN)
+    # A DST switch in local-time labels: the clock skips (spring) or repeats (autumn) one hour,
+    # at night, in March/April or October/November. A missing hour elsewhere is a real gap.
+    step = [i == 1 ? Hour(1) : times[i] - times[i-1] for i in eachindex(times)]
+    switch = [(step[i] == Hour(2) || step[i] == Hour(0)) && month(times[i]) in (3, 4, 10, 11) &&
+              hour(times[i]) <= 4 for i in eachindex(times)]
+    nswitch = cumsum(switch)
+    exact = dst = other = 0
+    for i in period+1:length(times)
+        gap = times[i] - times[i-period]
+        if gap == Day(1)
+            exact += 1
+        elseif (gap == Hour(23) || gap == Hour(25)) && nswitch[i] > nswitch[i-period]
+            dst += 1
+        else
+            other += 1
+        end
+    end
+    n = length(times) - period
+    return (exact=exact / n, dst=dst / n, other=other / n)
 end
 
 """
@@ -114,6 +163,7 @@ A prepared series together with its volatility scale.
 - scale: σ used for normalisation, 1 everywhere when normalize == :none;
   scale[t] depends only on r[1..t-1], so an estimate ẑ[t] converts back as ẑ[t]·scale[t]
 - ewma: EWMA σ (always computed), the baseline for |r| forecasts
+- period: seasonal lag in samples; the seasonal persistence baseline is r[t-period]
 """
 struct PreparedSeries
     r::Vector{Float64}
@@ -125,6 +175,7 @@ struct PreparedSeries
     ewma_lambda::Float64
     vol_window::Int
     vol_burnin::Int
+    period::Int                      # seasonal lag in samples for the seasonal persistence baseline (0 = none)
 end
 
 """
@@ -136,13 +187,13 @@ EWMA init window, or the rolling window), so the volatility estimate has settled
 """
 function normalize_series(r::AbstractVector{<:Real}, labels::AbstractVector=1:length(r);
                           normalize::Symbol=:none, ewma_lambda::Real=0.98, vol_window::Integer=168,
-                          vol_burnin::Integer=500, init_n::Integer=500)
+                          vol_burnin::Integer=500, init_n::Integer=500, period::Integer=0)
     normalize in NORMALIZATIONS || throw(ArgumentError("unknown normalisation $normalize; use one of $NORMALIZATIONS"))
     r = Vector{Float64}(r)
     labels = collect(labels)
     ewma = ewma_volatility(r; λ=ewma_lambda, init_n=init_n)
     if normalize == :none
-        return PreparedSeries(r, r, ones(length(r)), ewma, labels, normalize, ewma_lambda, vol_window, 0)
+        return PreparedSeries(r, r, ones(length(r)), ewma, labels, normalize, ewma_lambda, vol_window, 0, period)
     end
     σ = normalize == :ewma ? ewma : rolling_volatility(r; W=vol_window)
     burn = max(vol_burnin, normalize == :ewma ? init_n : vol_window)
@@ -152,7 +203,7 @@ function normalize_series(r::AbstractVector{<:Real}, labels::AbstractVector=1:le
     floor_ = 1e-12 * max(median(σk), eps())
     σk = max.(σk, floor_)                   # a flat stretch must not give z = ±Inf
     return PreparedSeries(r[keep], r[keep] ./ σk, σk, ewma[keep], labels[keep], normalize,
-                          ewma_lambda, vol_window, burn)
+                          ewma_lambda, vol_window, burn, period)
 end
 
 """
@@ -173,6 +224,7 @@ Parameters:
 - transform: one of TRANSFORMS
 - aggregate, stat: optional daily/weekly resampling (see AGGREGATES, STATS), applied before
   the transform, e.g. aggregate=:daily, stat=:mean, transform=:diff gives changes of daily means
+- period: the seasonal lag for :sdiff, in samples (after resampling)
 - noise: Gaussian noise added after the transform, as a fraction of the series' std
 
 Returns:
@@ -181,7 +233,7 @@ Returns:
 """
 function prepare_series(values::AbstractVector, labels::AbstractVector=1:length(values);
                         transform::Symbol=:diff, aggregate::Symbol=:none, stat::Symbol=:mean,
-                        noise::Real=0.0)
+                        period::Integer=0, noise::Real=0.0)
     transform in TRANSFORMS || throw(ArgumentError("unknown transform $transform; use one of $TRANSFORMS"))
     aggregate in AGGREGATES || throw(ArgumentError("unknown aggregation $aggregate; use one of $AGGREGATES"))
     keep = [!ismissing(v) && v isa Real && isfinite(v) for v in values]
@@ -196,6 +248,9 @@ function prepare_series(values::AbstractVector, labels::AbstractVector=1:length(
         s = v
     elseif transform == :diff
         s, l = diff(v), l[2:end]
+    elseif transform == :sdiff
+        0 < period < length(v) - 2 || throw(ArgumentError("seasonal differences need a period (in samples) shorter than the series"))
+        s, l = v[period+1:end] .- v[1:end-period], l[period+1:end]
     else
         any(<=(0), v) && throw(ArgumentError("log returns need strictly positive values"))
         s, l = diff(log.(v)), l[2:end]

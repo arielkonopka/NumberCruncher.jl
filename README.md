@@ -94,6 +94,19 @@ e.center[e.searchedIndex], r.realPoint[e.searchedIndex]   # estimate, real
   where the model beats EWMA.
 - **switch off shadow weighting**: `shadow=false` weights the successors by embedding distance
   only (plain k-NN analogues).
+- **run much faster**: PECUZAL takes over 80 % of the time of each point. `reembed_every=24`
+  chooses the delays and the Theiler window once per block of 24 points, from data that ends
+  before the block, and only rebuilds the delay vectors for each point (~0.01 s instead of
+  17–94 s on an 82 000-point window). `samplesize=0.1` lets PECUZAL evaluate a seeded 10 % of the
+  points (4–20× faster). Both change results; the defaults (1 and 1.0) reproduce the per-point
+  method exactly. On BTC returns PECUZAL's choice per point depends on the jitter (m = 1 or 5 for the
+  same window), so a block embedding is also more stable.
+- **handle daily cycles** (e.g. the sun in hourly weather data): `period` (default `:auto`, the
+  number of samples per day, 24 for hourly data) adds the baseline *same time, one period earlier*;
+  `transform=:sdiff` subtracts that value first, removing the cycle before the embedding. The lag
+  counts samples, so it always spans 24 real hours: downloads are in UTC, and with local-time files
+  the dataset summary reports daylight-saving switches (23/25 h between labels) separately from
+  real gaps, which do break the lag.
 
 ```julia
 r = do_the_thing2(2000, 10, 100; column=:close, transform=:logdiff, normalize=:ewma,

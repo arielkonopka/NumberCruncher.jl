@@ -129,7 +129,7 @@ $("ds-apply").addEventListener("click", async () => {
     const d = await api("/api/dataset", {
       file: $("ds-file").value, column: $("ds-column").value,
       transform: $("ds-transform").value, noise: parseFloat($("ds-noise").value) || 0,
-      aggregate: $("ds-aggregate").value, stat: $("ds-stat").value,
+      aggregate: $("ds-aggregate").value, stat: $("ds-stat").value, period: $("ds-period").value.trim() || "auto",
       normalize: $("ds-normalize").value, ewma_lambda: parseFloat($("ds-lambda").value),
       vol_window: parseInt($("ds-volwin").value), vol_burnin: parseInt($("ds-burnin").value),
     });
@@ -138,7 +138,8 @@ $("ds-apply").addEventListener("click", async () => {
   } catch (e) { say("ds-msg", e.message, "err"); }
 });
 
-const TRANSFORM_NAMES = { raw: "raw values", diff: "first differences", logdiff: "log returns" };
+const pct100 = (x) => x === null || x === undefined ? "–" : (100 * x).toFixed(2) + "%";
+const TRANSFORM_NAMES = { raw: "raw values", diff: "first differences", logdiff: "log returns", sdiff: "seasonal differences" };
 const resampleName = (d) => !d.aggregate || d.aggregate === "none" ? "" : ` · ${d.aggregate} ${d.stat}`;
 $("ds-aggregate").addEventListener("change", () => { $("ds-stat").disabled = $("ds-aggregate").value === "none"; });
 function syncNormalizeControls() {
@@ -156,7 +157,11 @@ function showDataset(d) {
   const label = `${d.file} · ${d.column}${resampleName(d)} · ${TRANSFORM_NAMES[d.transform]}${d.normalization ? " · " + d.normalization : ""}${d.noise > 0 ? ` · noise ${d.noise}` : ""}`;
   $("dataset-chip").textContent = `${label} (${d.length} values)`;
   $("ds-summary").innerHTML = `<div class="stats">
-    ${[["values", d.length], ["mean", fmt(d.mean)], ["std", fmt(d.std)], ["min", fmt(d.min)], ["max", fmt(d.max)]]
+    ${[["values", d.length], ["mean", fmt(d.mean)], ["std", fmt(d.std)], ["min", fmt(d.min)], ["max", fmt(d.max)],
+       ...(d.period > 0 ? [["season", `${d.period} samples`],
+         ["lags exactly 1 day", pct100(d.period_regularity.exact)],
+         ["DST shifts (23/25 h)", pct100(d.period_regularity.dst)],
+         ["gaps / duplicates", pct100(d.period_regularity.other)]] : [])]
       .map(([l, v]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("")}
     </div><div class="hint">${esc(d.first)} → ${esc(d.last)}</div>`;
   $("ds-preview").style.display = "block";
@@ -258,7 +263,8 @@ $("run-start").addEventListener("click", async () => {
   try {
     await api("/api/run", { n_points: parseInt($("run-n").value), ks,
       msize: parseInt($("run-msize").value), window: parseInt($("run-window").value),
-      seed: parseInt($("run-seed").value) || 1 });
+      seed: parseInt($("run-seed").value) || 1, reembed_every: parseInt($("run-every").value) || 1,
+      samplesize: parseFloat($("run-samplesize").value) || 1 });
     await refreshStatus();
     say("run-msg", "");
     renderRun();
@@ -324,7 +330,7 @@ function renderResults() {
   // Final numbers only: a p-value read while the run is still adding points is not a test result.
   const running = s.status === "running";
   $("res-info").innerHTML = `${esc(d.file)} · ${esc(d.column)}${esc(resampleName(d))} · ${TRANSFORM_NAMES[d.transform]}${normalized ? " · " + esc(d.normalization) : ""}${d.noise > 0 ? ` · noise ${d.noise}` : ""}
-    — scoring ${what} — ${s.results.length} of ${s.total} points, max delay ${p.msize}, window ${p.window}, seed ${p.seed}${running ? " <strong>(running: interim numbers, do not read p-values yet)</strong>" : ""}`;
+    — scoring ${what} — ${s.results.length} of ${s.total} points, max delay ${p.msize}, window ${p.window}, seed ${p.seed}${p.reembed_every > 1 ? `, re-embed every ${p.reembed_every}` : ""}${p.samplesize < 1 ? `, PECUZAL sample ${p.samplesize}` : ""}${running ? " <strong>(running: interim numbers, do not read p-values yet)</strong>" : ""}`;
 
   const m = s.metrics;
   const bestKnn = m.models.filter((r) => !r.baseline).reduce((a, b) => (b.mae < a.mae ? b : a));
@@ -391,7 +397,7 @@ $("res-csv").addEventListener("click", () => {
   if (!s || !s.results.length) return;
   const ks = s.params.ks;
   const fields = ["offset", "label", "m", "taus", "theiler", "real_r", "last_r", "real_z", "last_z", "scale", "ewma",
-    "ar1_r", "ar1_z", "win_mean_r", "win_mean_abs_r", "win_mean_z", "win_mean_abs_z"];
+    "ar1_r", "ar1_z", "seasonal_r", "seasonal_z", "win_mean_r", "win_mean_abs_r", "win_mean_z", "win_mean_abs_z"];
   const head = [...fields, ...ks.flatMap((k) => ["ret", "abs", "ret_ns", "abs_ns"].map((f) => `k${k}_${f}_z`))];
   const cell = (r, f) => f === "label" ? `"${r.label}"` : f === "taus" ? `"${r.taus.join(" ")}"` : r[f];
   const lines = s.results.map((r) => [...fields.map((f) => cell(r, f)),
@@ -410,7 +416,8 @@ $("ph-go").addEventListener("click", async () => {
   say("ph-msg", "Reconstructing…");
   try {
     state.phase = await api("/api/phase", { offset: parseInt($("ph-offset").value), msize: parseInt($("ph-msize").value),
-      window: parseInt($("ph-window").value), k: parseInt($("ph-k").value), seed: parseInt($("run-seed").value) || 1 });
+      window: parseInt($("ph-window").value), k: parseInt($("ph-k").value), seed: parseInt($("run-seed").value) || 1,
+      samplesize: parseFloat($("run-samplesize").value) || 1 });
     const ph = state.phase;
     const opts = ph.taus.map((t, j) => `<option value="${j}">s(n+${t})${j === ph.searched_index - 1 ? " — unknown" : ""}</option>`).join("");
     ["ph-x", "ph-y", "ph-z"].forEach((id, i) => { $(id).innerHTML = opts; $(id).value = String(Math.min(i, ph.m - 1)); });

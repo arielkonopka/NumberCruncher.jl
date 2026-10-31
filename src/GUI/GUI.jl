@@ -26,9 +26,10 @@ mutable struct Dataset
     file::String
     column::String
     transform::Symbol
+    aggregate::Symbol
+    stat::Symbol
     noise::Float64
-    series::Vector{Float64}
-    labels::Vector{String}
+    prep::PP.PreparedSeries          # r (original scale), z (embedded), σ scale, EWMA σ, labels
 end
 
 mutable struct RunJob
@@ -105,30 +106,28 @@ end
 
 downsample(n, maxn) = 1:max(1, cld(n, maxn)):n
 
+normalization_name(d::Dataset) = PP.describe_normalization(d.prep)
+
 function dataset_summary(d::Dataset)
-    s = d.series
+    s = d.prep.r
+    labels = string.(d.prep.labels)
     idx = downsample(length(s), 3000)
     return (file=d.file, column=d.column, transform=string(d.transform), noise=d.noise,
+            aggregate=string(d.aggregate), stat=string(d.stat),
+            normalize=string(d.prep.normalize), normalization=normalization_name(d),
+            burnin=d.prep.vol_burnin, z_std=d.prep.normalize == :none ? nothing : std(d.prep.z),
             length=length(s), mean=mean(s), std=std(s), min=minimum(s), max=maximum(s),
-            first=d.labels[1], last=d.labels[end],
-            preview=(index=collect(idx), labels=d.labels[idx], values=s[idx]))
+            first=labels[1], last=labels[end],
+            preview=(index=collect(idx), labels=labels[idx], values=s[idx]))
 end
 
 # ==============================================================================
 # ESTIMATION
 # ==============================================================================
 # The jitter is seeded per offset, so a run is reproducible and independent of thread order.
-function evaluate_point(d::Dataset, b, ks, msize, window, seed)
-    s = d.series
-    r0 = NC.run_series(s, b; windowSize=window, msize=msize, rng=Xoshiro(hash((seed, b))))
-    est = Dict{String,Float64}()
-    for k in ks
-        r1 = NC.analyzeit2(r0.Y, s, r0.tau_vals, b; k=k, theiler=r0.theiler)
-        est[string(k)] = r1.center[r1.searchedIndex]
-    end
-    return (offset=b, label=d.labels[end-b+1], m=length(r0.tau_vals), taus=r0.tau_vals, theiler=r0.theiler,
-            real=s[end-b+1], last=s[end-b], window_mean=mean(r0.dataOJit), est=est)
-end
+# Every variant (k, return/|return|, shadow on/off) comes from one reconstruction.
+evaluate_point(d::Dataset, b, ks, msize, window, seed) =
+    NC.estimate_point(d.prep, b; ks=ks, msize=msize, windowSize=window, seed=seed)
 
 function run_job!(job::RunJob, ks, msize, window, seed)
     n = job.total
@@ -158,8 +157,16 @@ end
 
 nanless(x) = x === nothing || (x isa Real && !isfinite(x)) ? nothing : x
 
-function score(e, real, last, raw)
+# Direction hit rate is used for returns; for |r| it is replaced by the share of points
+# where the model beats the EWMA forecast.
+function score(e, real, last, raw; ewma=nothing)
     err = e .- real
+    c = length(e) > 2 && std(e) > 0 && std(real) > 0 ? cor(e, real) : nothing
+    base = (mae=mean(abs.(err)), rmse=sqrt(mean(err .^ 2)), corr=nanless(c))
+    if ewma !== nothing
+        return merge(base, (hit=nothing, hit_p=nothing,
+                            beats_ewma=100 * mean(abs.(err) .< abs.(ewma .- real))))
+    end
     dir(x) = raw ? sign.(x .- last) : sign.(x)
     de, dr = dir(e), dir(real)
     ok = dr .!= 0
@@ -167,60 +174,95 @@ function score(e, real, last, raw)
     hits = count(de[ok] .== dr[ok])
     hit = defined ? 100 * hits / count(ok) : nothing
     hit_p = defined ? NC.Analysis.binomial_pvalue(hits, count(ok)) : nothing
-    c = length(e) > 2 && std(e) > 0 && std(real) > 0 ? cor(e, real) : nothing
-    return (mae=mean(abs.(err)), rmse=sqrt(mean(err .^ 2)), hit=nanless(hit), hit_p=hit_p, corr=nanless(c))
+    return merge(base, (hit=nanless(hit), hit_p=hit_p, beats_ewma=nothing))
+end
+
+"""
+The series one results view compares: target :return or :abs, scale :r (original) or :z
+(normalised), with or without the no-shadow models. Returns truth, last values and all
+models (k-NN first, then baselines) in that view.
+"""
+function view_series(res, ks; target=:return, scale=:r, ablation=false, raw=false)
+    f = target == :abs ? abs : identity
+    sc(r) = scale == :r ? r.scale : 1.0
+    real = [f(scale == :r ? r.real_r : r.real_z) for r in res]
+    last = [f(scale == :r ? r.last_r : r.last_z) for r in res]
+    knn = Pair{String,Vector{Float64}}[]
+    for k in ks, ns in (ablation ? (false, true) : (false,))
+        field = target == :abs ? (ns ? :abs_ns : :abs) : (ns ? :ret_ns : :ret)
+        push!(knn, "k = $k" * (ns ? ", no shadow" : "") => [getfield(r.est[string(k)], field) * sc(r) for r in res])
+    end
+    if target == :abs
+        # EWMA in this scale: σ_ewma (divided by the normalising σ for the z scale)
+        ew = [r.ewma / (scale == :r ? 1.0 : r.scale) for r in res]
+        baselines = ["EWMA σ·√(2/π)" => ew .* sqrt(2 / π), "EWMA σ" => ew, "persistence" => last,
+                     "window mean" => [scale == :r ? r.win_mean_abs_r : r.win_mean_abs_z for r in res]]
+    else
+        baselines = ["persistence" => last, "AR(1)" => [scale == :r ? r.ar1_r : r.ar1_z for r in res],
+                     "window mean" => [scale == :r ? r.win_mean_r : r.win_mean_z for r in res]]
+        # Predicting 0 only makes sense for changes, not for raw levels like a temperature.
+        raw || pushfirst!(baselines, "zero" => zeros(length(res)))
+    end
+    return (real=real, last=last, knn=knn, baselines=baselines)
 end
 
 # Everything is compared with the best naive baseline: skill > 0 beats all of them.
-function metrics(res, ks, raw)
-    isempty(res) && return (models=[], by_m=[], best_baseline=nothing)
-    real = [r.real for r in res]
-    last = [r.last for r in res]
-    baselines = ["persistence" => last, "window mean" => [r.window_mean for r in res]]
-    # Predicting 0 only makes sense for changes, not for raw levels like a temperature.
-    raw || pushfirst!(baselines, "zero" => zeros(length(res)))
-    knn = ["k = $k" => [r.est[string(k)] for r in res] for k in ks]
-    scored = [(model=name, baseline=i > length(knn), score(e, real, last, raw)...)
-              for (i, (name, e)) in enumerate(vcat(knn, baselines))]
+function metrics(res, ks, raw; target=:return, scale=:r, ablation=false)
+    isempty(res) && return (models=[], by_m=[], best_baseline=nothing, series=nothing)
+    v = view_series(res, ks; target=target, scale=scale, ablation=ablation, raw=raw)
+    ewma = target == :abs ? v.baselines[1][2] : nothing
+    scored = [(model=name, baseline=i > length(v.knn), score(e, v.real, v.last, raw; ewma=ewma)...)
+              for (i, (name, e)) in enumerate(vcat(v.knn, v.baselines))]
     best = argmin(r -> r.mae, filter(r -> r.baseline, scored))
     models = [merge(r, (skill=1 - r.mae / best.mae,)) for r in scored]
 
     by_m = []
     for m in sort(unique(r.m for r in res))
-        g = filter(r -> r.m == m, res)
-        gr, gl = [r.real for r in g], [r.last for r in g]
-        push!(by_m, (m=m, n=length(g),
-            knn=Dict(string(k) => score([r.est[string(k)] for r in g], gr, gl, raw) for k in ks),
-            persistence_mae=mean(abs.(gl .- gr)), zero_mae=mean(abs.(gr))))
+        sel = [r.m == m for r in res]
+        push!(by_m, (m=m, n=count(sel),
+            knn=Dict(name => score(e[sel], v.real[sel], v.last[sel], raw;
+                                   ewma=ewma === nothing ? nothing : ewma[sel]) for (name, e) in v.knn),
+            persistence_mae=mean(abs.(v.last[sel] .- v.real[sel])),
+            best_baseline_mae=mean(abs.(Dict(v.baselines)[best.model][sel] .- v.real[sel]))))
     end
-    return (models=models, by_m=by_m, best_baseline=best.model)
+    series = (labels=[r.label for r in res], real=v.real, last=v.last,
+              models=Dict(name => e for (name, e) in vcat(v.knn, v.baselines)))
+    return (models=models, by_m=by_m, best_baseline=best.model, series=series)
 end
 
-function job_status(job)
+function job_status(job; target=:return, scale=:r, ablation=false)
     job === nothing && return (status="idle",)
     res = lock(job.lock) do
         sort(copy(job.results), by=r -> r.offset, rev=true)
     end
     ks = job.params["ks"]
-    raw = job.dataset.transform == :raw
+    d = job.dataset
+    raw = d.transform == :raw
+    scale = d.prep.normalize == :none ? :r : scale
     finished = something(job.finished, now())
+    # Rows without the m-dimensional vectors keep the payload small.
+    rows = [Base.structdiff(r, NamedTuple{(:real_point,)}) for r in res]
+    rows = [merge(r, (est=Dict(k => Base.structdiff(e, NamedTuple{(:center,)}) for (k, e) in r.est),)) for r in rows]
     return (status=string(job.status), message=job.message, params=job.params,
-            dataset=(file=job.dataset.file, column=job.dataset.column,
-                     transform=string(job.dataset.transform), noise=job.dataset.noise),
+            dataset=(file=d.file, column=d.column, transform=string(d.transform), noise=d.noise,
+                     aggregate=string(d.aggregate), stat=string(d.stat),
+                     normalize=string(d.prep.normalize), normalization=normalization_name(d)),
             total=job.total, done=job.done[], failed=job.failed[],
             elapsed=Dates.value(finished - job.started) / 1000,
-            raw=raw, metrics=metrics(res, ks, raw), results=res)
+            raw=raw, view=(target=string(target), scale=string(scale), ablation=ablation),
+            metrics=metrics(res, ks, raw; target=target, scale=scale, ablation=ablation), results=rows)
 end
 
 function phase_space(d::Dataset, b, msize, window, k, seed)
-    s = d.series
+    s = d.prep.z
     r0 = NC.run_series(s, b; windowSize=window, msize=msize, rng=Xoshiro(hash((seed, b))))
     Y = r0.Y
     r1 = NC.analyzeit2(Y, s, r0.tau_vals, b; k=k, theiler=r0.theiler)
     idx = downsample(length(Y), 4000)
     cols(pts) = [[p[j] for p in pts] for j in 1:length(r0.tau_vals)]
     return (taus=r0.tau_vals, theiler=r0.theiler, m=length(r0.tau_vals), n=length(Y),
-            searched_index=r1.searchedIndex, label=d.labels[end-b+1],
+            searched_index=r1.searchedIndex, label=string(d.prep.labels[end-b+1]),
+            normalization=normalization_name(d),
             trajectory=cols(Y[idx]), neighbours=cols(Y[r1.neigs.idxs]),
             successors=cols(Y[r1.neigs.idxs .+ 1]),
             last=collect(Y[end]), estimate=r1.center, real=r0.realPoint)
@@ -233,6 +275,7 @@ function get_data(req)
     files = onworker(list_files)
     d = DATASET[]
     return json_response((data_dir=DATA_DIR, files=files, transforms=string.(PP.TRANSFORMS),
+                          aggregates=string.(PP.AGGREGATES), stats=string.(PP.STATS),
                           meteo_variables=DM.METEO_VARIABLES, yahoo_intervals=DM.YAHOO_INTERVALS,
                           dataset=d === nothing ? nothing : dataset_summary(d),
                           fetch=FETCH[], key_present=isfile(NC.CRYPTOCOMPARE_KEY_FILE)))
@@ -243,13 +286,24 @@ function post_dataset(req)
     path = data_path(p["file"])
     column = string(p["column"])
     transform = Symbol(get(p, "transform", "diff"))
+    aggregate = Symbol(get(p, "aggregate", "none"))
+    stat = Symbol(get(p, "stat", "mean"))
+    normalize = Symbol(get(p, "normalize", "none"))
+    λ = getnum(p, "ewma_lambda", 0.98)
+    vol_window = getnum(p, "vol_window", 168, Int)
+    burnin = getnum(p, "vol_burnin", 500, Int)
+    normalize != :none && transform == :raw &&
+        throw(ArgumentError("volatility normalisation applies to changes or returns, not raw values"))
     noise = getnum(p, "noise", 0.0)
     0 <= noise <= 10 || throw(ArgumentError("noise must be between 0 and 10 (fraction of std)"))
     d = onworker() do
         df = DM.LoadData(path)
         column in names(df) || throw(ArgumentError("column '$column' not in $(basename(path))"))
-        prep = PP.prepare_series(df[!, column], DM.RowLabels(df); transform=transform, noise=noise)
-        Dataset(basename(path), column, transform, noise, prep.series, prep.labels)
+        prep = PP.prepare_series(df[!, column], DM.RowLabels(df); transform=transform,
+                                 aggregate=aggregate, stat=stat, noise=noise)
+        np = PP.normalize_series(prep.series, prep.labels; normalize=normalize, ewma_lambda=λ,
+                                 vol_window=vol_window, vol_burnin=burnin)
+        Dataset(basename(path), column, transform, aggregate, stat, noise, np)
     end
     DATASET[] = d
     return json_response(dataset_summary(d))
@@ -349,7 +403,7 @@ function post_run(req)
         msize = getnum(p, "msize", 10, Int)
         window = getnum(p, "window", 82000, Int)
         seed = getnum(p, "seed", 1, Int)
-        1 <= n <= length(d.series) ÷ 2 || throw(ArgumentError("points to test must be between 1 and $(length(d.series) ÷ 2)"))
+        1 <= n <= length(d.prep.z) ÷ 2 || throw(ArgumentError("points to test must be between 1 and $(length(d.prep.z) ÷ 2)"))
         !isempty(ks) && all(>=(1), ks) || throw(ArgumentError("k values must be positive"))
         1 <= msize <= 200 || throw(ArgumentError("max delay must be between 1 and 200"))
         window >= 100 || throw(ArgumentError("window must be at least 100"))
@@ -368,14 +422,19 @@ function post_stop(req)
     return json_response((ok=true,))
 end
 
-get_status(req) = json_response(job_status(JOB[]))
+function get_status(req)
+    q = HTTP.queryparams(HTTP.URI(req.target))
+    target = get(q, "target", "return") == "abs" ? :abs : :return
+    scale = get(q, "scale", "r") == "z" ? :z : :r
+    return json_response(job_status(JOB[]; target=target, scale=scale, ablation=get(q, "ablation", "") == "1"))
+end
 
 function post_phase(req)
     p = body(req)
     d = DATASET[]
     d === nothing && throw(ArgumentError("choose a dataset first"))
     b = getnum(p, "offset", 1, Int)
-    1 <= b <= length(d.series) ÷ 2 || throw(ArgumentError("offset out of range"))
+    1 <= b <= length(d.prep.z) ÷ 2 || throw(ArgumentError("offset out of range"))
     r = onworker(() -> phase_space(d, b, getnum(p, "msize", 10, Int), getnum(p, "window", 82000, Int),
                                    getnum(p, "k", 50, Int), getnum(p, "seed", 1, Int)))
     return json_response(r)

@@ -77,6 +77,32 @@ e = NumberCruncher.analyzeit2(r.Y, s, r.tau_vals, 1; k=30)
 e.center[e.searchedIndex], r.realPoint[e.searchedIndex]   # estimate, real
 ```
 
+### Resampling, volatility normalisation and targets
+
+`do_the_thing2` (and the GUI) can also:
+
+- **resample** before differencing, e.g. changes of BTC's daily mean price:
+  `do_the_thing2(200, 30, 25; aggregate=:daily, stat=:mean)`. Differences of averages are
+  autocorrelated even for a random walk (lag-1 ≈ 0.25), so compare against the AR(1) baseline,
+  not only against zero.
+- **normalise by volatility**: `normalize=:ewma` (`ewma_lambda=0.98`) or `:rolling`
+  (`vol_window=168`) embeds z = r/σ, where σ is estimated from past values only, after a burn-in
+  (`vol_burnin=500`). Estimates are converted back with σ, so all scores stay in the original scale
+  (`est_z`/`real_z` hold the normalised ones). `normalize=:none` gives exactly the old results.
+- **forecast volatility**: `target=:abs_return` estimates |r|. Its baselines are the EWMA forecast
+  σ·√(2/π) and persistence |r_t|; `summarize` reports skill against them and the share of points
+  where the model beats EWMA.
+- **switch off shadow weighting**: `shadow=false` weights the successors by embedding distance
+  only (plain k-NN analogues).
+
+```julia
+r = do_the_thing2(2000, 10, 100; column=:close, transform=:logdiff, normalize=:ewma,
+                  target=:abs_return, datafile="data/bitcoin_hourly_data_test_data.csv")
+summarize(r)
+```
+In the GUI, target, scale and shadow are switches on the Results tab: each point stores every
+variant, so changing them needs no rerun.
+
 ## Your PC's Personal Workout: A High-Intensity Benchmark
 
 Be aware that this program is a resource-intensive benchmark. It will consume a significant amount of your CPU and RAM. It is not recommended to run it with a large number of threads unless you have ample memory. While I intend to refactor it for better efficiency, for now, please proceed with caution. I found that running with six threads was a safe setting for all my measurements.

@@ -112,6 +112,7 @@ function suggestTransform() {
   const c = ($("ds-column").value || "").toLowerCase();
   const priceLike = /close|open|high|low|price|sp500|djia|nasdaq|^[a-z]{3,}$/.test(c) && !/temperature|humidity|pressure|wind|cloud|precip|^x$|^y$|^z$/.test(c);
   $("ds-transform").value = priceLike ? "logdiff" : "raw";
+  syncNormalizeControls();
 }
 
 function pickFile(name) {
@@ -128,6 +129,9 @@ $("ds-apply").addEventListener("click", async () => {
     const d = await api("/api/dataset", {
       file: $("ds-file").value, column: $("ds-column").value,
       transform: $("ds-transform").value, noise: parseFloat($("ds-noise").value) || 0,
+      aggregate: $("ds-aggregate").value, stat: $("ds-stat").value,
+      normalize: $("ds-normalize").value, ewma_lambda: parseFloat($("ds-lambda").value),
+      vol_window: parseInt($("ds-volwin").value), vol_burnin: parseInt($("ds-burnin").value),
     });
     showDataset(d);
     say("ds-msg", "Dataset ready. Next: Run or Phase space.", "ok");
@@ -135,9 +139,21 @@ $("ds-apply").addEventListener("click", async () => {
 });
 
 const TRANSFORM_NAMES = { raw: "raw values", diff: "first differences", logdiff: "log returns" };
+const resampleName = (d) => !d.aggregate || d.aggregate === "none" ? "" : ` · ${d.aggregate} ${d.stat}`;
+$("ds-aggregate").addEventListener("change", () => { $("ds-stat").disabled = $("ds-aggregate").value === "none"; });
+function syncNormalizeControls() {
+  const raw = $("ds-transform").value === "raw";
+  if (raw) $("ds-normalize").value = "none";
+  $("ds-normalize").disabled = raw;
+  const n = $("ds-normalize").value;
+  $("ds-lambda").disabled = n !== "ewma";
+  $("ds-volwin").disabled = n !== "rolling";
+  $("ds-burnin").disabled = n === "none";
+}
+["ds-transform", "ds-normalize"].forEach((id) => $(id).addEventListener("change", syncNormalizeControls));
 function showDataset(d) {
   state.dataset = d;
-  const label = `${d.file} · ${d.column} · ${TRANSFORM_NAMES[d.transform]}${d.noise > 0 ? ` · noise ${d.noise}` : ""}`;
+  const label = `${d.file} · ${d.column}${resampleName(d)} · ${TRANSFORM_NAMES[d.transform]}${d.normalization ? " · " + d.normalization : ""}${d.noise > 0 ? ` · noise ${d.noise}` : ""}`;
   $("dataset-chip").textContent = `${label} (${d.length} values)`;
   $("ds-summary").innerHTML = `<div class="stats">
     ${[["values", d.length], ["mean", fmt(d.mean)], ["std", fmt(d.std)], ["min", fmt(d.min)], ["max", fmt(d.max)]]
@@ -240,10 +256,10 @@ $("run-start").addEventListener("click", async () => {
   const ks = $("run-ks").value.split(/[\s,;]+/).filter(Boolean).map(Number);
   if (!ks.length || ks.some((k) => !Number.isInteger(k) || k < 1)) return say("run-msg", "k values must be positive integers.", "err");
   try {
-    const s = await api("/api/run", { n_points: parseInt($("run-n").value), ks,
+    await api("/api/run", { n_points: parseInt($("run-n").value), ks,
       msize: parseInt($("run-msize").value), window: parseInt($("run-window").value),
       seed: parseInt($("run-seed").value) || 1 });
-    state.status = s;
+    await refreshStatus();
     say("run-msg", "");
     renderRun();
     startPolling();
@@ -254,11 +270,18 @@ $("run-stop").addEventListener("click", async () => {
   say("run-msg", "Stopping after the reconstructions in progress…", "warn");
 });
 
+// The results view (target, scale, shadow ablation) is scored on the server from stored rows.
+const viewQuery = () => `?target=${$("res-target").value}&scale=${$("res-scale").value}&ablation=${$("res-ablation").checked ? 1 : 0}`;
+async function refreshStatus() {
+  state.status = await api("/api/run/status" + viewQuery());
+  return state.status;
+}
+
 function startPolling() {
   clearInterval(state.polling);
   state.polling = setInterval(async () => {
     try {
-      state.status = await api("/api/run/status");
+      await refreshStatus();
       renderRun();
       if ($("tab-results").classList.contains("active")) renderResults();
       if (state.status.status !== "running") clearInterval(state.polling);
@@ -283,57 +306,69 @@ function renderRun() {
 }
 
 // ------------------------------------------------------------------ results
+const pval = (p) => p === null || p === undefined ? "–" : p < 1e-4 ? "<0.0001" : p.toFixed(4);
+const pct = (x) => x === null || x === undefined ? "–" : x.toFixed(1) + "%";
+
 function renderResults() {
   const s = state.status;
   if (!s || s.status === "idle" || !s.results.length) {
     $("res-info").textContent = s && s.status === "running" ? "Waiting for the first points…" : "No run yet.";
     return;
   }
-  const p = s.params, d = s.dataset;
-  $("res-info").innerHTML = `${esc(d.file)} · ${esc(d.column)} · ${TRANSFORM_NAMES[d.transform]}${d.noise > 0 ? ` · noise ${d.noise}` : ""}
-    — ${s.results.length} of ${s.total} points, max delay ${p.msize}, window ${p.window}${s.status === "running" ? " (running…)" : ""}`;
+  const p = s.params, d = s.dataset, v = s.view;
+  const normalized = d.normalize && d.normalize !== "none";
+  $("res-scale").disabled = !normalized;
+  if (!normalized) $("res-scale").value = "r";
+  const abs = v.target === "abs";
+  const what = `${abs ? "|change|" : "change"}${v.scale === "z" ? ", normalised scale" : ""}`;
+  // Final numbers only: a p-value read while the run is still adding points is not a test result.
+  const running = s.status === "running";
+  $("res-info").innerHTML = `${esc(d.file)} · ${esc(d.column)}${esc(resampleName(d))} · ${TRANSFORM_NAMES[d.transform]}${normalized ? " · " + esc(d.normalization) : ""}${d.noise > 0 ? ` · noise ${d.noise}` : ""}
+    — scoring ${what} — ${s.results.length} of ${s.total} points, max delay ${p.msize}, window ${p.window}, seed ${p.seed}${running ? " <strong>(running: interim numbers, do not read p-values yet)</strong>" : ""}`;
 
   const m = s.metrics;
   const bestKnn = m.models.filter((r) => !r.baseline).reduce((a, b) => (b.mae < a.mae ? b : a));
+  const thirdHead = abs ? `<th class="num">beats EWMA</th>` : `<th class="num">Hit rate</th><th class="num">p (hit vs 50%)</th>`;
   $("res-table").innerHTML = `<thead><tr><th>Model</th><th class="num">MAE</th><th class="num">RMSE</th>
-      <th class="num">Skill</th><th class="num">Hit rate</th><th class="num">p (hit vs 50%)</th><th class="num">Correlation</th></tr></thead><tbody>` +
+      <th class="num">Skill</th>${thirdHead}<th class="num">Correlation</th></tr></thead><tbody>` +
     m.models.map((r) => `<tr class="${r.baseline ? "baseline" : ""} ${r === bestKnn ? "best" : ""}">
       <td>${esc(r.model)}${r.model === m.best_baseline ? " (best baseline)" : ""}</td>
       <td class="num">${fmt(r.mae)}</td><td class="num">${fmt(r.rmse)}</td>
       <td class="num ${r.baseline ? "" : r.skill > 0 ? "pos" : "neg"}">${fmt(r.skill)}</td>
-      <td class="num">${r.hit === null ? "–" : r.hit.toFixed(1) + "%"}</td>
-      <td class="num">${r.hit_p === null ? "–" : r.hit_p < 1e-4 ? "<0.0001" : r.hit_p.toFixed(4)}</td><td class="num">${fmt(r.corr)}</td></tr>`).join("") +
-    `</tbody>`;
-  const n = m.models.length ? s.results.length : 0;
-  const ci = n ? (196 * Math.sqrt(0.25 / n)).toFixed(1) : "–";
-  $("res-table").insertAdjacentHTML("beforeend",
-    `<caption style="caption-side:bottom;text-align:left" class="hint">With ${n} points, hit rates within roughly 50 ± ${ci}% are indistinguishable from a coin flip; p is the exact two-sided binomial test.</caption>`);
+      ${abs ? `<td class="num">${pct(r.beats_ewma)}</td>` : `<td class="num">${pct(r.hit)}</td><td class="num">${running ? "–" : pval(r.hit_p)}</td>`}
+      <td class="num">${fmt(r.corr)}</td></tr>`).join("") + `</tbody>`;
+  const n = s.results.length;
+  const ci = (196 * Math.sqrt(0.25 / n)).toFixed(1);
+  $("res-table").insertAdjacentHTML("beforeend", abs
+    ? `<caption style="caption-side:bottom;text-align:left" class="hint">For |change| the hit rate is meaningless; “beats EWMA” is the share of points where the model's error is smaller than the EWMA forecast's.</caption>`
+    : `<caption style="caption-side:bottom;text-align:left" class="hint">With ${n} points, hit rates within roughly 50 ± ${ci}% are indistinguishable from a coin flip; p is the exact two-sided binomial test, shown once the run has finished.</caption>`);
 
   const kSel = $("res-k");
   const prev = kSel.value;
-  kSel.innerHTML = p.ks.map((k) => `<option value="${k}">k = ${k}</option>`).join("");
-  kSel.value = p.ks.map(String).includes(prev) ? prev : String(bestKnn.model.replace("k = ", ""));
+  const names = m.models.filter((r) => !r.baseline).map((r) => r.model);
+  kSel.innerHTML = names.map((nm) => `<option>${esc(nm)}</option>`).join("");
+  kSel.value = names.includes(prev) ? prev : bestKnn.model;
   drawResultCharts();
 
-  $("res-bym").innerHTML = `<thead><tr><th>m</th><th class="num">points</th><th class="num">MAE (k=${kSel.value})</th>
-      <th class="num">persistence MAE</th><th class="num">zero MAE</th><th class="num">hit rate</th></tr></thead><tbody>` +
+  $("res-bym").innerHTML = `<thead><tr><th>m</th><th class="num">points</th><th class="num">MAE (${esc(kSel.value)})</th>
+      <th class="num">best baseline MAE</th><th class="num">persistence MAE</th><th class="num">${abs ? "beats EWMA" : "hit rate"}</th></tr></thead><tbody>` +
     m.by_m.map((g) => { const sc = g.knn[kSel.value];
       return `<tr><td>${g.m}</td><td class="num">${g.n}</td><td class="num">${fmt(sc.mae)}</td>
-        <td class="num">${fmt(g.persistence_mae)}</td><td class="num">${fmt(g.zero_mae)}</td>
-        <td class="num">${sc.hit === null ? "–" : sc.hit.toFixed(1) + "%"}</td></tr>`; }).join("") + `</tbody>`;
+        <td class="num">${fmt(g.best_baseline_mae)}</td><td class="num">${fmt(g.persistence_mae)}</td>
+        <td class="num">${pct(abs ? sc.beats_ewma : sc.hit)}</td></tr>`; }).join("") + `</tbody>`;
 }
 
 function drawResultCharts() {
-  const s = state.status, k = $("res-k").value;
-  const res = s.results;
-  const x = res.map((r) => r.label);
-  const real = res.map((r) => r.real), est = res.map((r) => r.est[k]);
+  const s = state.status, name = $("res-k").value, ser = s.metrics.series;
+  if (!ser) return;
+  const x = ser.labels, real = ser.real, est = ser.models[name];
+  const abs = s.view.target === "abs";
   const traces = [
     { x, y: real, name: "real", mode: "lines+markers", line: { color: COLORS.real, width: 1.5 }, marker: { size: 4 } },
-    { x, y: est, name: `estimate (k=${k})`, mode: "lines+markers", line: { color: COLORS.est, width: 1.5, dash: "dot" }, marker: { size: 4 } },
+    { x, y: est, name: `estimate (${name})`, mode: "lines+markers", line: { color: COLORS.est, width: 1.5, dash: "dot" }, marker: { size: 4 } },
   ];
-  if (s.raw) traces.push({ x, y: res.map((r) => r.last), name: "persistence", mode: "lines",
-    line: { color: COLORS.traj, width: 1 } });
+  if (abs) traces.push({ x, y: ser.models["EWMA σ·√(2/π)"], name: "EWMA σ·√(2/π)", mode: "lines", line: { color: COLORS.ok, width: 1 } });
+  else if (s.raw) traces.push({ x, y: ser.last, name: "persistence", mode: "lines", line: { color: COLORS.traj, width: 1 } });
   Plotly.react("res-series", traces, layout(), plotCfg);
   Plotly.react("res-hist", [{ x: est.map((e, i) => e - real[i]), type: "histogram", name: "estimate − real",
     marker: { color: COLORS.est }, nbinsx: 30 }], layout({ showlegend: false, bargap: 0.05,
@@ -344,14 +379,23 @@ function drawResultCharts() {
     layout({ showlegend: false, yaxis: { title: "MAE", color: cssVar("--text"), gridcolor: cssVar("--plot-grid") } }), plotCfg);
 }
 $("res-k").addEventListener("change", renderResults);
+["res-target", "res-scale", "res-ablation"].forEach((id) => $(id).addEventListener("change", async () => {
+  if (!state.status || state.status.status === "idle") return;
+  try { await refreshStatus(); renderResults(); } catch (e) { say("run-msg", e.message, "err"); }
+}));
 
+// Exports every stored value, so any view can be recomputed offline. Estimates are in the
+// normalised (z) scale; multiply by `scale` for the original scale.
 $("res-csv").addEventListener("click", () => {
   const s = state.status;
   if (!s || !s.results.length) return;
   const ks = s.params.ks;
-  const head = ["offset", "label", "m", "taus", "theiler", "real", "last", "window_mean", ...ks.map((k) => `est_k${k}`)];
-  const lines = s.results.map((r) => [r.offset, `"${r.label}"`, r.m, `"${r.taus.join(" ")}"`, r.theiler, r.real, r.last,
-    r.window_mean, ...ks.map((k) => r.est[k])].join(","));
+  const fields = ["offset", "label", "m", "taus", "theiler", "real_r", "last_r", "real_z", "last_z", "scale", "ewma",
+    "ar1_r", "ar1_z", "win_mean_r", "win_mean_abs_r", "win_mean_z", "win_mean_abs_z"];
+  const head = [...fields, ...ks.flatMap((k) => ["ret", "abs", "ret_ns", "abs_ns"].map((f) => `k${k}_${f}_z`))];
+  const cell = (r, f) => f === "label" ? `"${r.label}"` : f === "taus" ? `"${r.taus.join(" ")}"` : r[f];
+  const lines = s.results.map((r) => [...fields.map((f) => cell(r, f)),
+    ...ks.flatMap((k) => ["ret", "abs", "ret_ns", "abs_ns"].map((f) => r.est[k][f]))].join(","));
   const blob = new Blob([[head.join(","), ...lines].join("\n")], { type: "text/csv" });
   const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob),
     download: `results_${s.dataset.file.replace(/\.csv$/, "")}_${s.dataset.column}.csv` });
@@ -427,8 +471,8 @@ autoName();
 (async () => {
   try {
     await loadData();
-    const s = await api("/api/run/status");
-    if (s.status !== "idle") { state.status = s; renderRun(); if (s.status === "running") startPolling(); }
+    const s = await refreshStatus();
+    if (s.status !== "idle") { renderRun(); if (s.status === "running") startPolling(); }
   } catch (e) { say("ds-msg", "Cannot reach the NumberCruncher server: " + e.message, "err"); }
 })();
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {

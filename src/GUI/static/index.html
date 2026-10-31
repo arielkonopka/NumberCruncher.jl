@@ -106,15 +106,41 @@ code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size:
         <label>Column<select id="ds-column"></select></label>
       </div>
       <div class="row">
+        <label>Resample<select id="ds-aggregate">
+          <option value="none">no resampling</option>
+          <option value="daily">daily</option>
+          <option value="weekly">weekly</option>
+        </select></label>
+        <label>Statistic<select id="ds-stat" disabled>
+          <option value="mean">mean</option>
+          <option value="median">median</option>
+          <option value="last">last</option>
+          <option value="min">min</option>
+          <option value="max">max</option>
+        </select></label>
+      </div>
+      <div class="row">
         <label>Preparation<select id="ds-transform">
           <option value="raw">raw values</option>
           <option value="diff">first differences</option>
           <option value="logdiff">log returns</option>
         </select></label>
         <label>Added noise (× std)<input id="ds-noise" type="number" min="0" max="10" step="0.01" value="0"></label>
+      </div>
+      <div class="row">
+        <label>Volatility normalisation<select id="ds-normalize">
+          <option value="none">none</option>
+          <option value="ewma">EWMA (RiskMetrics)</option>
+          <option value="rolling">rolling std</option>
+        </select></label>
+        <label>EWMA λ<select id="ds-lambda" disabled>
+          <option>0.97</option><option selected>0.98</option><option>0.99</option>
+        </select></label>
+        <label>Rolling window<input id="ds-volwin" type="number" value="168" min="2" disabled></label>
+        <label>Burn-in<input id="ds-burnin" type="number" value="500" min="0" disabled></label>
         <button class="btn" id="ds-apply">Use dataset</button>
       </div>
-      <p class="hint" id="ds-hint">Prices: log returns. Weather or Lorenz: raw values (or differences). Noise tests robustness on clean data.</p>
+      <p class="hint" id="ds-hint">Prices: log returns. Weather or Lorenz: raw values (or differences). Resampling (e.g. daily mean) runs before the preparation and needs a date/time column; incomplete days or weeks are dropped. Volatility normalisation divides changes by a past-only volatility estimate σ<sub>t</sub> (it never uses the value it scales), embeds z = r/σ and converts estimates back with σ; scores stay in the original scale. Noise tests robustness on clean data.</p>
       <div class="msg" id="ds-msg"></div>
       <div id="ds-summary"></div>
       <div id="ds-preview" class="plot" style="display:none"></div>
@@ -243,9 +269,19 @@ code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size:
   <div class="card">
     <h2>Scores</h2>
     <div class="hint" id="res-info">No run yet.</div>
-    <p class="hint">Skill compares MAE with the best naive baseline (<em>persistence</em> = last value, <em>window mean</em>, and <em>zero</em> for changes): above 0 beats all of them. Hit rate is the share of correct directions (sign of the change for raw values, of the value itself otherwise).</p>
+    <p class="hint">Target, scale and shadow are views of the same run: every point stores all of them, so switching needs no rerun. Without shadow weighting the successors are weighted by embedding distance only (plain k-NN analogues). For |change| the baselines are the EWMA forecast σ·√(2/π) (and σ itself), persistence |r<sub>t</sub>| and the window mean of |r|.</p>
+    <p class="hint">Skill compares MAE with the best naive baseline (<em>persistence</em> = last value, <em>AR(1)</em> fitted on the window, <em>window mean</em>, and <em>zero</em> for changes): above 0 beats all of them. AR(1) matters for resampled data: changes of daily or weekly means are autocorrelated even for a random walk. Hit rate is the share of correct directions (sign of the change for raw values, of the value itself otherwise).</p>
     <div class="scroll"><table id="res-table"></table></div>
     <div class="row" style="margin-top:12px">
+      <label>Target<select id="res-target">
+        <option value="return">change (return)</option>
+        <option value="abs">|change| (volatility)</option>
+      </select></label>
+      <label>Scale<select id="res-scale" disabled>
+        <option value="r">original</option>
+        <option value="z">normalised (z)</option>
+      </select></label>
+      <label class="inline"><input type="checkbox" id="res-ablation"> compare without shadow weighting</label>
       <label>Charts for<select id="res-k"></select></label>
       <button class="btn secondary" id="res-csv">Download CSV</button>
     </div>

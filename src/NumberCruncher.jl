@@ -198,7 +198,9 @@ analyzeit2(Y, df::DataFrame, taus, backSize; kwargs...) = analyzeit2(Y, df.delta
 # s is the prepared series the reconstruction Y was built from.
 # theiler: states closer than this in time to Y[end] lie on the same stretch of trajectory
 # and are not real neighbours; pass the w from run_series. The default 1 keeps the old Y[1:end-2].
-function analyzeit2(Y, s::AbstractVector, taus, backSize; k=Analysis.DEFAULT_K, theiler::Integer=1)
+# shadow=false: plain k-NN analogues, weighted by the embedding distance only.
+function analyzeit2(Y, s::AbstractVector, taus, backSize; k=Analysis.DEFAULT_K, theiler::Integer=1,
+                    shadow::Bool=true)
     nsearch = length(Y) - 1 - theiler
     nsearch >= 1 || throw(ArgumentError("Theiler window $theiler leaves no candidate neighbours"))
     k = min(k, nsearch)
@@ -219,12 +221,43 @@ function analyzeit2(Y, s::AbstractVector, taus, backSize; k=Analysis.DEFAULT_K, 
     end
     
     # Obliczenie ważonego środka ciężkości przesuniętych sąsiadów.
-    center = NumberCruncher.Analysis.weighted_center2(
-        Y[neighs.idxs .+ 1],
-        neighs.dists,
-        rPoint
-    )
-    return (center=center, neigs=neighs,searchedIndex=idx)
+    successors = Y[neighs.idxs .+ 1]
+    weights = Analysis.neighbour_weights(successors, neighs.dists, rPoint; shadow=shadow)
+    center = [Analysis.weighted_coordinate(successors, weights, j) for j in 1:tLen]
+    return (center=center, neigs=neighs, searchedIndex=idx, rPoint=rPoint, successors=successors, weights=weights)
+end
+
+"""
+Walk-forward estimate of the hidden value p.z[end-b+1] from everything before it.
+
+One reconstruction of p.z serves every variant: for each k it gives the estimate of the
+value and of its absolute value, with shadow weighting (known coordinates) and without.
+Estimates are in the z scale; multiply by `scale` for the original scale (scale is 1 when
+the series is not normalised). The row also carries the truth and the naive baselines.
+"""
+function estimate_point(p::Preprocessor.PreparedSeries, b; ks=(Analysis.DEFAULT_K,), msize=10,
+                        windowSize=82000, seed=1)
+    z = p.z
+    n = length(z)
+    t = n - b + 1
+    r0 = run_series(z, b; windowSize=windowSize, msize=msize, rng=Xoshiro(hash((seed, b))))
+    win = (n - b - length(r0.dataOJit) + 1):(n - b)
+    est = Dict{String,Any}()
+    idx = argmax(r0.tau_vals)
+    for k in ks
+        a = analyzeit2(r0.Y, z, r0.tau_vals, b; k=k, theiler=r0.theiler)
+        w0 = Analysis.neighbour_weights(a.successors, a.neigs.dists, a.rPoint; shadow=false)
+        est[string(k)] = (ret=a.center[idx], abs=Analysis.weighted_coordinate(a.successors, a.weights, idx; f=abs),
+                          ret_ns=Analysis.weighted_coordinate(a.successors, w0, idx),
+                          abs_ns=Analysis.weighted_coordinate(a.successors, w0, idx; f=abs),
+                          center=a.center)
+    end
+    rw, zw = p.r[win], z[win]
+    return (offset=b, label=string(p.labels[t]), m=length(r0.tau_vals), taus=r0.tau_vals,
+            theiler=r0.theiler, searched_index=idx, real_point=r0.realPoint,
+            real_r=p.r[t], last_r=p.r[t-1], real_z=z[t], last_z=z[t-1], scale=p.scale[t], ewma=p.ewma[t],
+            win_mean_r=mean(rw), win_mean_abs_r=mean(abs, rw), win_mean_z=mean(zw), win_mean_abs_z=mean(abs, zw),
+            ar1_r=Analysis.ar1_forecast(rw, p.r[t-1]), ar1_z=Analysis.ar1_forecast(zw, z[t-1]), est=est)
 end
 
 # ==============================================================================
@@ -284,12 +317,32 @@ end
 # ==============================================================================
 # Sequentially analyses the last N points to evaluate predictive performance.
 # Each point gets its own seeded jitter, so a run is reproducible for a given seed.
+#
+# The series is `transform` (:diff or :logdiff) of `column`; aggregate=:daily (or :weekly)
+# uses the daily `stat` (e.g. mean) first, and n_points then counts days (weeks).
+# normalize=:ewma/:rolling embeds volatility-normalised values z = r/σ (σ ex-ante) and converts
+# estimates back with σ; all scores stay in the original scale (est_z/real_z add the z scale).
+# target=:abs_return estimates |r| instead of r; shadow=false uses plain k-NN weights.
 function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=DEFAULT_DATAFILE,
-                       windowSize=82000)
+                       windowSize=82000, column=:open, transform::Symbol=:diff,
+                       aggregate::Symbol=:none, stat::Symbol=:mean,
+                       normalize::Symbol=:none, ewma_lambda=0.98, vol_window=168, vol_burnin=500,
+                       target::Symbol=:return, shadow::Bool=true)
+    target in (:return, :abs_return) || throw(ArgumentError("target must be :return or :abs_return"))
+    if aggregate == :none && column == :open && transform == :diff
+        mydf = load_deltas(datafile)            # the original hourly deltaO series
+        s, labels = mydf.deltaO, DataManager.RowLabels(mydf)
+    else
+        raw = DataManager.LoadData(datafile)
+        prep = Preprocessor.prepare_series(raw[!, column], DataManager.RowLabels(raw);
+                                           aggregate=aggregate, stat=stat, transform=transform)
+        s, labels = prep.series, prep.labels
+    end
+    p = Preprocessor.normalize_series(s, labels; normalize=normalize, ewma_lambda=ewma_lambda,
+                                      vol_window=vol_window, vol_burnin=vol_burnin)
+    n_points <= length(p.z) ÷ 2 || throw(ArgumentError("only $(length(p.z)) values; test at most $(length(p.z) ÷ 2) points"))
     backRange = n_points:-1:1
-    mydf = load_deltas(datafile)
-    s = mydf.deltaO
-    
+
     # Thread-safe container
     results_all_vec = Vector{NamedTuple}()
     results_lock = ReentrantLock()
@@ -298,26 +351,28 @@ function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=D
 
     Threads.@threads for ix in 1:length(backRange)
         x = backRange[ix]
-        
-        # Logging progress
         println("Processing point: $x")
-        
-        r0 = run_series(s, x; windowSize=windowSize, msize=tausize, rng=Xoshiro(hash((seed, x))))
-
-        println("Executing state estimation for offset: $x")
-        r1 = analyzeit2(r0.Y, s, r0.tau_vals, x; k=k_neighs, theiler=r0.theiler)
-        println("iAfter analysis, offset: $x, idx $(r1.searchedIndex) tau vals: $(r0.tau_vals) est: $(r1.center) real: $(r0.realPoint)")
+        e = estimate_point(p, x; ks=(k_neighs,), msize=tausize, windowSize=windowSize, seed=seed)
+        v = e.est[string(k_neighs)]
+        ez = target == :return ? (shadow ? v.ret : v.ret_ns) : (shadow ? v.abs : v.abs_ns)
+        f = target == :return ? identity : abs
+        println("iAfter analysis, offset: $x, idx $(e.searched_index) tau vals: $(e.taus) est: $(v.center) real: $(e.real_point)")
         lock(results_lock) do
             push!(results_all_vec, (
                 time_offset = x,
-                taus = r0.tau_vals,
-                theiler = r0.theiler,
-                searched_index = r1.searchedIndex,
-                est_x = r1.center[r1.searchedIndex],
-                real_x = r0.realPoint[r1.searchedIndex],
-                persistence_x = s[end-x],          # baseline: the last known delta
-                est = r1.center,
-                real = r0.realPoint,
+                taus = e.taus,
+                theiler = e.theiler,
+                searched_index = e.searched_index,
+                est_x = ez * e.scale,               # original scale
+                real_x = f(e.real_r),
+                persistence_x = f(e.last_r),        # baseline: the last known value
+                ar1_x = e.ar1_r,
+                ewma_x = e.ewma * sqrt(2 / π),      # baseline for |r|: expected |r| under N(0, σ²)
+                est_z = ez,
+                real_z = f(e.real_z),
+                sigma = e.scale,
+                est = v.center,
+                real = e.real_point,
             ))
         end
     end
@@ -325,11 +380,20 @@ function do_the_thing2(n_points=100, tausize=30, k_neighs=50; seed=1, datafile=D
     df = DataFrame(results_all_vec)
     sort!(df, :time_offset, rev=true)
     df.dists = abs.(df.est_x .- df.real_x)
+    metadata!(df, "target", string(target))
+    metadata!(df, "normalize", Preprocessor.describe_normalization(p))
     return df
 end
 
-# Skill of a do_the_thing2 result against the zero and persistence predictors.
-summarize(df::DataFrame) = Analysis.skill_summary(df.est_x, df.real_x, df.persistence_x)
+# Skill of a do_the_thing2 result against the naive predictors (zero, persistence and AR(1)
+# for returns; EWMA and persistence for |r|).
+function summarize(df::DataFrame)
+    if metadata(df, "target", "return") == "abs_return"
+        return Analysis.abs_skill_summary(df.est_x, df.real_x, df.persistence_x, df.ewma_x)
+    end
+    return Analysis.skill_summary(df.est_x, df.real_x, df.persistence_x;
+                                  ar1="ar1_x" in names(df) ? df.ar1_x : nothing)
+end
 
 
 

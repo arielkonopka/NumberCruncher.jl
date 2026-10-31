@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NumberCruncher</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085; --line: #e1e4ea;
+  --accent: #2f6fdb; --accent-text: #ffffff; --ok: #1f8f55; --bad: #c43d3d; --warn: #b7791f;
+  --input: #ffffff; --chip: #eef2f8; --shadow: 0 1px 2px rgba(20, 30, 50, .06);
+  --plot-grid: #e8ebf0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1f27; --text: #e5e8ee; --muted: #9099ab; --line: #2b323d;
+    --accent: #6c9cf0; --accent-text: #0d1117; --ok: #4cc38a; --bad: #ef6b6b; --warn: #e3a948;
+    --input: #141820; --chip: #232a35; --shadow: none; --plot-grid: #2b323d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 24px; padding: 12px 24px; background: var(--panel);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 6px;
+  font: inherit; cursor: pointer; }
+nav button.active { background: var(--chip); color: var(--text); font-weight: 600; }
+#dataset-chip { margin-left: auto; color: var(--muted); font-size: 13px; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 60px; }
+section.tab { display: none; }
+section.tab.active { display: block; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px;
+  box-shadow: var(--shadow); margin-bottom: 16px; min-width: 0; }
+.card h2 { font-size: 15px; margin: 0 0 12px; }
+.card h3 { font-size: 13px; margin: 14px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+label.inline { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+input, select { background: var(--input); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 8px; font: inherit; min-width: 0; }
+input[type=number] { width: 110px; }
+input.wide, select.wide { width: 220px; }
+button.btn { background: var(--accent); color: var(--accent-text); border: 0; border-radius: 6px;
+  padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+button.btn.secondary { background: var(--chip); color: var(--text); font-weight: 500; }
+button.btn.danger { background: var(--bad); color: #fff; }
+button.btn:disabled { opacity: .5; cursor: default; }
+.hint { color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
+.msg { font-size: 13px; margin-top: 8px; min-height: 1em; }
+.msg.err { color: var(--bad); } .msg.ok { color: var(--ok); } .msg.warn { color: var(--warn); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.clickable { cursor: pointer; } tr.clickable:hover td { background: var(--chip); }
+tr.baseline td { color: var(--muted); }
+tr.best td { font-weight: 600; }
+.pos { color: var(--ok); } .neg { color: var(--bad); }
+.scroll { overflow-x: auto; }
+.segmented { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+.segmented button { background: var(--chip); border: 0; color: var(--text); padding: 6px 10px; border-radius: 6px;
+  font: inherit; cursor: pointer; }
+.segmented button.active { background: var(--accent); color: var(--accent-text); }
+.source { display: none; } .source.active { display: block; }
+.progress { height: 8px; background: var(--chip); border-radius: 4px; overflow: hidden; margin: 10px 0; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.stats { display: flex; gap: 22px; flex-wrap: wrap; margin: 6px 0; }
+.stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat .l { font-size: 12px; color: var(--muted); }
+.plot { width: 100%; height: 360px; }
+.plot.tall { height: 560px; }
+.checks { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 6px 0 10px; }
+code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+@media (max-width: 640px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  .grid { grid-template-columns: 1fr; }
+  #dataset-chip { margin-left: 0; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>NumberCruncher</h1>
+  <nav>
+    <button data-tab="data" class="active">Data</button>
+    <button data-tab="run">Run</button>
+    <button data-tab="results">Results</button>
+    <button data-tab="phase">Phase space</button>
+  </nav>
+  <div id="dataset-chip">No dataset selected</div>
+</header>
+
+<main>
+<!-- ============================== DATA ============================== -->
+<section class="tab active" id="tab-data">
+  <div class="grid">
+    <div class="card">
+      <h2>Dataset</h2>
+      <p class="hint">Choose a file, the column to analyse and how to prepare it. Every run and phase-space view uses this dataset.</p>
+      <div class="row">
+        <label>File<select id="ds-file" class="wide"></select></label>
+        <label>Column<select id="ds-column"></select></label>
+      </div>
+      <div class="row">
+        <label>Preparation<select id="ds-transform">
+          <option value="raw">raw values</option>
+          <option value="diff">first differences</option>
+          <option value="logdiff">log returns</option>
+        </select></label>
+        <label>Added noise (× std)<input id="ds-noise" type="number" min="0" max="10" step="0.01" value="0"></label>
+        <button class="btn" id="ds-apply">Use dataset</button>
+      </div>
+      <p class="hint" id="ds-hint">Prices: log returns. Weather or Lorenz: raw values (or differences). Noise tests robustness on clean data.</p>
+      <div class="msg" id="ds-msg"></div>
+      <div id="ds-summary"></div>
+      <div id="ds-preview" class="plot" style="display:none"></div>
+    </div>
+
+    <div class="card">
+      <h2>Get data</h2>
+      <div class="segmented" id="src-tabs">
+        <button data-src="upload" class="active">Upload CSV</button>
+        <button data-src="yahoo">Stocks &amp; indexes</button>
+        <button data-src="fred">FRED</button>
+        <button data-src="weather">Weather</button>
+        <button data-src="lorenz">Lorenz</button>
+        <button data-src="crypto">Bitcoin</button>
+      </div>
+
+      <div class="source active" id="src-upload">
+        <p class="hint">Any CSV with at least one numeric column. A <code>date</code>, <code>time</code> or <code>timestamp</code> column is used for labels.</p>
+        <div class="row">
+          <label>CSV file<input type="file" id="up-file" accept=".csv,text/csv"></label>
+          <label>Save as<input id="up-name" class="wide" placeholder="my_data.csv"></label>
+          <button class="btn" id="up-go">Upload</button>
+        </div>
+      </div>
+
+      <div class="source" id="src-yahoo">
+        <p class="hint">Yahoo Finance symbols, e.g. <code>AAPL</code>, <code>MSFT</code>, <code>^GSPC</code> (S&amp;P 500), <code>^DJI</code>, <code>^IXIC</code>, <code>^GDAXI</code>, <code>WIG20.WA</code>, <code>EURUSD=X</code>. Unofficial endpoint: it can change or rate-limit without notice. Hourly data covers the last 730 days.</p>
+        <div class="row">
+          <label>Symbol<input id="yh-symbol" value="^GSPC"></label>
+          <label>Interval<select id="yh-interval"></select></label>
+          <label>Save as<input id="yh-name" class="wide"></label>
+          <button class="btn" id="yh-go">Download</button>
+        </div>
+      </div>
+
+      <div class="source" id="src-fred">
+        <p class="hint">Series from the St. Louis Fed, e.g. <code>SP500</code>, <code>DJIA</code>, <code>NASDAQCOM</code>, <code>VIXCLS</code>, <code>DEXUSEU</code>. Search on fred.stlouisfed.org for more.</p>
+        <div class="row">
+          <label>Series id<input id="fr-series" value="SP500"></label>
+          <label>Save as<input id="fr-name" class="wide"></label>
+          <button class="btn" id="fr-go">Download</button>
+        </div>
+      </div>
+
+      <div class="source" id="src-weather">
+        <p class="hint">Hourly ERA5 reanalysis from the Open-Meteo archive, back to 1940. Long ranges take a while to download.</p>
+        <div class="row">
+          <label>Latitude<input id="wx-lat" type="number" step="0.01" value="52.23"></label>
+          <label>Longitude<input id="wx-lon" type="number" step="0.01" value="21.01"></label>
+          <label>From<input id="wx-start" type="date" value="2015-01-01"></label>
+          <label>To<input id="wx-end" type="date"></label>
+        </div>
+        <div class="checks" id="wx-vars"></div>
+        <div class="row">
+          <label>Save as<input id="wx-name" class="wide" value="weather_warsaw.csv"></label>
+          <button class="btn" id="wx-go">Download</button>
+        </div>
+      </div>
+
+      <div class="source" id="src-lorenz">
+        <p class="hint">Integrates the Lorenz system and writes columns <code>t, x, y, z</code>. A small Δt needs a larger max delay on the Run tab (e.g. 30–60).</p>
+        <div class="row">
+          <label>Samples N<input id="lz-N" type="number" value="20000" min="1000"></label>
+          <label>Δt<input id="lz-dt" type="number" value="0.01" step="0.001"></label>
+          <label>Transient<input id="lz-ttr" type="number" value="100"></label>
+        </div>
+        <div class="row">
+          <label>σ<input id="lz-sigma" type="number" value="10" step="0.1"></label>
+          <label>ρ<input id="lz-rho" type="number" value="28" step="0.1"></label>
+          <label>β<input id="lz-beta" type="number" value="2.6667" step="0.0001"></label>
+          <label>x₀, y₀, z₀<input id="lz-u0" value="0, 10, 0"></label>
+        </div>
+        <div class="row">
+          <label>Save as<input id="lz-name" class="wide" value="lorenz.csv"></label>
+          <button class="btn" id="lz-go">Generate</button>
+        </div>
+      </div>
+
+      <div class="source" id="src-crypto">
+        <p class="hint">Hourly BTC/USD from CryptoCompare. Needs your API key in <code>config/cryptocompare_key.txt</code>. Free keys hit a rate limit; whatever arrived before it is saved.</p>
+        <div class="row">
+          <label>From<input id="cc-start" type="date" value="2008-01-01"></label>
+          <label>Save as<input id="cc-name" class="wide" value="btc_cryptocompare.csv"></label>
+          <button class="btn" id="cc-go">Download</button>
+        </div>
+        <div class="msg" id="cc-status"></div>
+      </div>
+      <div class="msg" id="src-msg"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Files in <span id="data-dir">data/</span></h2>
+    <div class="scroll"><table id="files-table">
+      <thead><tr><th>File</th><th class="num">Rows</th><th>Numeric columns</th><th>From</th><th>To</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ============================== RUN ============================== -->
+<section class="tab" id="tab-run">
+  <div class="card">
+    <h2>Walk-forward run</h2>
+    <p class="hint">Hides each of the last <em>N</em> values in turn, reconstructs the phase space from everything before it (PECUZAL) and estimates the hidden value from the k nearest neighbours. Neighbours within the Theiler window of the last state are excluded, and the seed makes a run reproducible. Several k values are scored from the same reconstruction at almost no extra cost.</p>
+    <div class="row">
+      <label>Points to test<input id="run-n" type="number" value="100" min="1"></label>
+      <label>k values<input id="run-ks" value="10, 25, 50, 100"></label>
+      <label>Max delay (τ)<input id="run-msize" type="number" value="10" min="1" max="200"></label>
+      <label>Window<input id="run-window" type="number" value="82000" min="100"></label>
+      <label>Seed<input id="run-seed" type="number" value="1" step="1"></label>
+    </div>
+    <div class="row">
+      <button class="btn" id="run-start">Start</button>
+      <button class="btn danger" id="run-stop" disabled>Stop</button>
+    </div>
+    <p class="hint">Stop lets the reconstructions already in progress finish. Each point costs one PECUZAL run (from under a second to a minute, depending on window and max delay).</p>
+    <div class="progress"><div id="run-bar"></div></div>
+    <div class="stats" id="run-stats"></div>
+    <div class="msg" id="run-msg"></div>
+  </div>
+</section>
+
+<!-- ============================== RESULTS ============================== -->
+<section class="tab" id="tab-results">
+  <div class="card">
+    <h2>Scores</h2>
+    <div class="hint" id="res-info">No run yet.</div>
+    <p class="hint">Skill compares MAE with the best naive baseline (<em>persistence</em> = last value, <em>window mean</em>, and <em>zero</em> for changes): above 0 beats all of them. Hit rate is the share of correct directions (sign of the change for raw values, of the value itself otherwise).</p>
+    <div class="scroll"><table id="res-table"></table></div>
+    <div class="row" style="margin-top:12px">
+      <label>Charts for<select id="res-k"></select></label>
+      <button class="btn secondary" id="res-csv">Download CSV</button>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>Estimate vs. real</h2><div id="res-series" class="plot"></div></div>
+    <div class="card"><h2>Error distribution</h2><div id="res-hist" class="plot"></div></div>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>MAE by k</h2><div id="res-bars" class="plot"></div></div>
+    <div class="card">
+      <h2>By embedding dimension</h2>
+      <p class="hint">PECUZAL picks the dimension m per point; this shows whether some reconstructions estimate better.</p>
+      <div class="scroll"><table id="res-bym"></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PHASE ============================== -->
+<section class="tab" id="tab-phase">
+  <div class="card">
+    <h2>Phase space</h2>
+    <p class="hint">Reconstructs the phase space at one offset and shows the last known point, its k neighbours, their successors and the estimate of the next point.</p>
+    <div class="row">
+      <label>Offset<input id="ph-offset" type="number" value="1" min="1"></label>
+      <label>Max delay (τ)<input id="ph-msize" type="number" value="10" min="1"></label>
+      <label>Window<input id="ph-window" type="number" value="82000" min="100"></label>
+      <label>k<input id="ph-k" type="number" value="50" min="1"></label>
+      <button class="btn" id="ph-go">Reconstruct</button>
+    </div>
+    <div class="row">
+      <label>X axis<select id="ph-x"></select></label>
+      <label>Y axis<select id="ph-y"></select></label>
+      <label>Z axis<select id="ph-z"></select></label>
+      <label class="inline"><input type="checkbox" id="ph-3d" checked> 3-D</label>
+    </div>
+    <div class="msg" id="ph-msg"></div>
+    <div id="ph-info" class="stats"></div>
+    <div id="ph-plot" class="plot tall"></div>
+  </div>
+</section>
+</main>
+
+<script src="/plotly.min.js"></script>
+<script>
+  // Fall back to the CDN if PlotlyJS.jl's bundled copy is unavailable.
+  if (!window.Plotly) document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.2/plotly.min.js"><\/script>');
+</script>
+<script src="/app.js"></script>
+</body>
+</html>
